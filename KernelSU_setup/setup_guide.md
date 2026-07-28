@@ -1,4 +1,4 @@
-# Fast Setup Guide: ReDroid 14 + KernelSU-Next + Zygisk Next + LSPosed
+# Fast Setup Guide: ReDroid 14 + KernelSU-Next + Zygisk Next + LSPosed + GApps
 
 This is the command-first installation guide. The default path uses the
 already-built kernel packages and the automation in [`vps/`](vps/). A detailed
@@ -14,6 +14,7 @@ read [`my_setup_journey.md`](my_setup_journey.md).
 - KernelSU Manager
 - Zygisk Next
 - LSPosed
+- Optional systemless Google Play Services and Play Store
 - Persistent Binder devices
 - Bounded Docker resources and log rotation
 - A watchdog, boot validator, and ten-minute stability monitor
@@ -884,6 +885,295 @@ adb -s 127.0.0.1:5555 shell su -c 'logcat -d | grep -i -E "zygisk|lsposed" | tai
 KernelSU Manager and the LSPosed UI can then be opened inside Android. If
 Android asks for root authorization, approve only the apps you trust.
 
+## 12. Optional: add GApps and Google Play Store
+
+This section adds Google Play Services, Google Services Framework, and Play
+Store to the existing pinned ReDroid 14 image without rebuilding that image.
+Skip it if you want a Google-free Android instance.
+
+### 12.1 Understand the support boundary
+
+ReDroid documents that GMS can be added with GApps and describes building GApps
+directly into a custom image. For this already-deployed KernelSU instance, the
+shorter route is a systemless LiteGapps module:
+
+- [ReDroid GMS support](https://github.com/remote-android/redroid-doc#gms-support)
+- [ReDroid image-build method](https://github.com/remote-android/redroid-doc/blob/master/android-builder-docker/README.md#build-with-gapps)
+- [LiteGapps KernelSU Next installation](https://litegapps.github.io/doc/installation.html)
+- [KernelSU Next Magic Mount](https://kernelsu-next.github.io/webpage/#dynamic-module-mount)
+
+This method is optional and experimental in ReDroid. LiteGapps itself warns
+that its systemless mode is not fully functional and may have limitations such
+as contact synchronization. ReDroid also does not guarantee that every app,
+location API, payment flow, Play Integrity level, DRM feature, or hardware API
+will work merely because Play Store opens.
+
+For a production image where GMS must be part of `/system`, build and pin a
+custom ReDroid image using ReDroid's image-build method instead. Do not silently
+replace the image digest in
+[`deploy_redroid14_v2.sh`](vps/deploy_redroid14_v2.sh); a custom image requires
+its own digest, validation run, and rollback test.
+
+### 12.2 Confirm the Android target and absence of existing GApps
+
+Run on the VPS:
+
+```bash
+export ADB_SERIAL=127.0.0.1:5555
+export CONTAINER=redroid14-ksu
+
+adb connect "$ADB_SERIAL"
+adb -s "$ADB_SERIAL" wait-for-device
+
+test "$(adb -s "$ADB_SERIAL" shell getprop ro.build.version.sdk | tr -d '\r')" = 34
+test "$(adb -s "$ADB_SERIAL" shell getprop ro.product.cpu.abi | tr -d '\r')" = arm64-v8a
+test "$(adb -s "$ADB_SERIAL" shell getprop sys.boot_completed | tr -d '\r')" = 1
+
+adb -s "$ADB_SERIAL" shell pm list packages | \
+  grep -E 'com\.google\.android\.gms|com\.google\.android\.gsf|com\.android\.vending' || true
+```
+
+The final command should print nothing. Do not install LiteGapps over a ROM that
+already contains GApps; the upstream installer warns that the two copies can
+conflict.
+
+Confirm KernelSU and its existing modules are healthy:
+
+```bash
+sudo docker exec "$CONTAINER" /data/adb/ksud -V
+sudo docker exec "$CONTAINER" /data/adb/ksud module list
+```
+
+### 12.3 Select Magic Mount in KernelSU Next
+
+LiteGapps requires KernelSU Next's Magic Mount mode for systemless installation.
+KernelSU Next can switch between Magic Mount and OverlayFS, but this GApps
+procedure must not be attempted with OverlayFS selected.
+
+Using `scrcpy` through the Step 10 SSH tunnel:
+
+```powershell
+scrcpy -s 127.0.0.1:5555
+```
+
+Open **KernelSU Next → Settings**, find the module-mount implementation, and
+select **Magic Mount**. LiteGapps documentation calls this “Magisk Mount”; in
+KernelSU Next the corresponding implementation is named Magic Mount.
+
+Return to the VPS and inspect the selected module mount:
+
+```bash
+sudo docker exec "$CONTAINER" /data/adb/ksud module mount
+```
+
+The result must identify Magic Mount. If it reports OverlayFS, return to the
+Manager, change the setting, and do not continue until the setting is saved.
+
+### 12.4 Download and verify the pinned Android 14 ARM64 package
+
+The Lite variant is used because it contains the minimum useful Google stack:
+common permissions, Google Services Framework, Google Play Services, Play
+Store, and Google Contacts Sync Adapter. The larger Core/Nano/Pixel variants
+add setup and application packages that are unnecessary on this headless VPS.
+See the [official variant comparison](https://litegapps.github.io/doc/litegapps_variant.html).
+
+Install only the host-side download/inspection tools:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y curl unzip
+```
+
+Download the pinned package from the project's official SourceForge release:
+
+```bash
+export GAPPS_NAME=LiteGapps-arm64-14.0-20260118-official.zip
+export GAPPS_DIR=/home/ubuntu/kbuild/artifacts/gapps
+export GAPPS_ZIP="$GAPPS_DIR/$GAPPS_NAME"
+export GAPPS_URL="https://downloads.sourceforge.net/project/litegapps/litegapps/arm64/34/lite/2026-01-18/$GAPPS_NAME"
+export GAPPS_SHA256=6308d96e359dd61f40ff32c9828108a0b2695cc21701204600b4513b7379876a
+
+mkdir -p "$GAPPS_DIR"
+curl -fL --retry 3 --retry-delay 2 \
+  -o "$GAPPS_ZIP.part" "$GAPPS_URL"
+mv "$GAPPS_ZIP.part" "$GAPPS_ZIP"
+
+printf '%s  %s\n' "$GAPPS_SHA256" "$GAPPS_ZIP" | sha256sum -c -
+unzip -p "$GAPPS_ZIP" module.prop
+```
+
+The metadata must include:
+
+```text
+id=litegapps
+name=litegapps arm64 14.0 official
+version=v4.9
+date=18-01-2026
+```
+
+The exact upstream file is
+[LiteGapps ARM64 Android 14 Lite, 2026-01-18](https://sourceforge.net/projects/litegapps/files/litegapps/arm64/34/lite/2026-01-18/LiteGapps-arm64-14.0-20260118-official.zip/download).
+The SHA-256 above was independently calculated from that file on 2026-07-28.
+If you choose a newer release, do not reuse this digest: verify its architecture,
+Android API, module metadata, and new checksum separately.
+
+Google applications are proprietary. This project deliberately does not bundle
+or redistribute the ZIP; each operator downloads it from its publisher and is
+responsible for the applicable licence and Google terms.
+
+### 12.5 Install LiteGapps as a KernelSU module
+
+Push the verified ZIP into Android and install it with the same pinned `ksud`
+used for the other modules:
+
+```bash
+adb -s "$ADB_SERIAL" push "$GAPPS_ZIP" /data/local/tmp/litegapps.zip
+
+sudo docker exec "$CONTAINER" \
+  /data/adb/ksud module install /data/local/tmp/litegapps.zip
+
+adb -s "$ADB_SERIAL" shell rm -f /data/local/tmp/litegapps.zip
+sudo docker exec "$CONTAINER" /data/adb/ksud module list
+
+sudo docker exec "$CONTAINER" sh -c '
+  test -f /data/adb/modules_update/litegapps/module.prop ||
+  test -f /data/adb/modules/litegapps/module.prop
+'
+```
+
+The module list must contain `litegapps`. Stop if installation reports an
+architecture, SDK, space, mount, or permission error.
+
+### 12.6 Reboot the host—not only Android
+
+This environment requires a host reboot to replay KernelSU's init hooks and
+activate newly installed modules. `adb reboot`, `docker restart`, and restarting
+only `redroid14-ksu` are insufficient.
+
+Step 8 should already have made `6.8.12-zksu` the saved GRUB default. Verify it:
+
+```bash
+test "$(uname -r)" = 6.8.12-zksu
+sudo grub-editenv list
+```
+
+Confirm `saved_entry` names `6.8.12-zksu`, then reboot:
+
+```bash
+sudo reboot
+```
+
+Reconnect after the VPS returns:
+
+```bash
+test "$(uname -r)" = 6.8.12-zksu
+systemctl is-active redroid14.service redroid14-watchdog.service
+
+adb connect 127.0.0.1:5555
+adb -s 127.0.0.1:5555 wait-for-device
+test "$(adb -s 127.0.0.1:5555 shell getprop sys.boot_completed | tr -d '\r')" = 1
+```
+
+### 12.7 Verify Play Services and Play Store
+
+```bash
+for package in \
+  com.google.android.gsf \
+  com.google.android.gms \
+  com.android.vending
+do
+  echo "Checking $package"
+  adb -s 127.0.0.1:5555 shell pm path "$package" | grep -q '^package:'
+done
+
+adb -s 127.0.0.1:5555 shell dumpsys package com.android.vending | \
+  grep -m1 versionName
+
+sudo docker exec redroid14-ksu /data/adb/ksud module list | \
+  grep -i litegapps
+
+sudo /usr/local/sbin/validate-redroid14
+```
+
+Launch Play Store:
+
+```bash
+adb -s 127.0.0.1:5555 shell monkey \
+  -p com.android.vending \
+  -c android.intent.category.LAUNCHER 1
+```
+
+Use `scrcpy` to complete Google sign-in inside the Android UI. Never paste a
+Google password into an ADB command, shell history, setup script, or log file.
+
+After Google Play Services has settled, check for repeated crashes:
+
+```bash
+adb -s 127.0.0.1:5555 shell logcat -d | \
+  grep -iE 'FATAL EXCEPTION|com\.google\.android\.gms|com\.android\.vending' | \
+  tail -200
+
+sudo docker stats --no-stream redroid14-ksu
+```
+
+A few startup messages are normal. Repeated process deaths, `FATAL EXCEPTION`,
+or a rapidly rising PID count are not; disable the module rather than allowing
+a restart storm.
+
+Run another ten-minute stability gate because GMS adds background services:
+
+```bash
+sudo systemd-run \
+  --unit=redroid14-gapps-stability-check \
+  --collect \
+  --property=Type=exec \
+  /usr/local/sbin/monitor-redroid14-10m
+
+sudo journalctl -fu redroid14-gapps-stability-check
+```
+
+### 12.8 Play Protect certification is separate
+
+In Play Store, open **Profile → Settings → About → Play Protect certification**.
+Google explains that rooted or modified Android systems may remain uncertified,
+and that uncertified devices or apps may not function correctly. Installing
+GApps does not certify ReDroid and does not guarantee Play Integrity.
+
+References:
+
+- [Google: check and fix Play Protect certification](https://support.google.com/android/answer/7165974)
+- [Google: uncertified/custom-ROM device registration](https://www.google.com/android/uncertified/)
+
+If registration is offered, submit the **Google Services Framework ID** shown
+by a trusted device-ID tool—not the ordinary Android Settings ID. Registration
+can take time and is not a promise that a rooted cloud instance will become
+certified or pass integrity checks.
+
+### 12.9 Disable LiteGapps if Android becomes unstable
+
+Because this installation is systemless, the recovery path does not modify the
+base Docker image. If Android boot-loops while the VPS remains reachable:
+
+```bash
+sudo systemctl stop redroid14-watchdog.service redroid14.service
+
+for module_dir in \
+  /home/ubuntu/redroid14-data/adb/modules/litegapps \
+  /home/ubuntu/redroid14-data/adb/modules_update/litegapps
+do
+  if sudo test -d "$module_dir"; then
+    sudo touch "$module_dir/disable"
+  fi
+done
+
+sudo reboot
+```
+
+After recovery, inspect LiteGapps and Android logs before deleting module data.
+The [LiteGapps removal instructions](https://litegapps.github.io/doc/uninstall.html)
+also warn that Google application updates should be removed before uninstalling
+the systemless module, otherwise Google apps can force-close or boot-loop.
+
 ---
 
 ## Script reference
@@ -965,3 +1255,8 @@ known-good boot first.
 - Do not delete an existing container or data directory merely because deployment refuses it.
 - Do not remove the stock Ubuntu kernel; it is the rollback path.
 - Do not republish bundled third-party binaries without checking their licenses.
+- Do not install LiteGapps over an image that already contains GApps.
+- Do not use an ARM, x86, or non-Android-14 GApps package on this ARM64/API-34 image.
+- Do not activate a systemless GApps package with OverlayFS; select Magic Mount.
+- Do not assume Play Store presence means Play Protect certification or Play Integrity.
+- Do not use `adb reboot` or `docker restart` to activate a new KernelSU module here.
