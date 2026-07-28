@@ -693,15 +693,21 @@ stages Zygisk Next and LSPosed.
 Its important Docker limits are already encoded in the script:
 
 ```text
-CPU:                1 core
-Memory:             6 GiB
-Memory + swap:      8 GiB
-PIDs:               1536
+CPU:                1.5 cores
+Memory:             8 GiB
+Memory + swap:      10 GiB
+PIDs:               8192
 Restart policy:     no
 Docker log:         50 MiB x 2 files
 ADB host binding:   127.0.0.1:5555
 /dev/kmsg:          mapped to /dev/null
 ```
+
+The 8,192-task hard cap and the watchdog's lower 7,000-task limit leave ample
+headroom for Google Play Services and modding workloads while still containing
+a genuine thread or process storm. The earlier 1,536/1,400 limits are sufficient
+for bare ReDroid but kill a healthy GApps boot. The 7,000-task guard also remains
+below the previously observed runaway workload of about 8,230 tasks.
 
 If the script refuses an existing `redroid14-ksu` container or a nonempty
 `/home/ubuntu/redroid14-data`, stop and inspect them. Do not blindly delete an
@@ -944,30 +950,73 @@ sudo docker exec "$CONTAINER" /data/adb/ksud -V
 sudo docker exec "$CONTAINER" /data/adb/ksud module list
 ```
 
-### 12.3 Select Magic Mount in KernelSU Next
+### 12.3 Install the Magic Mount metamodule
 
-LiteGapps requires KernelSU Next's Magic Mount mode for systemless installation.
-KernelSU Next can switch between Magic Mount and OverlayFS, but this GApps
-procedure must not be attempted with OverlayFS selected.
+LiteGapps changes the system directory, while a fresh KernelSU Next installation
+does not mount ordinary modules by itself. It needs one active
+[metamodule](https://kernelsu.org/guide/metamodule.html). The pinned `ksud 3.3.0`
+used by this project has no `ksud module mount` command and no Manager setting
+that substitutes for this prerequisite. Install a real metamodule instead.
 
-Using `scrcpy` through the Step 10 SSH tunnel:
-
-```powershell
-scrcpy -s 127.0.0.1:5555
-```
-
-Open **KernelSU Next → Settings**, find the module-mount implementation, and
-select **Magic Mount**. LiteGapps documentation calls this “Magisk Mount”; in
-KernelSU Next the corresponding implementation is named Magic Mount.
-
-Return to the VPS and inspect the selected module mount:
+This procedure uses the
+[Magic Mount metamodule](https://modules.kernelsu.org/module/meta-mm/), which is
+compatible with the Magisk-style mount layout expected by LiteGapps:
 
 ```bash
-sudo docker exec "$CONTAINER" /data/adb/ksud module mount
+export META_NAME=meta-magic_mount-v1.0.1-sprout-release.zip
+export META_DIR=/home/ubuntu/kbuild/artifacts/gapps
+export META_ZIP="$META_DIR/$META_NAME"
+export META_URL="https://github.com/KernelSU-Modules-Repo/meta-mm/releases/download/v1.0.1-sprout/$META_NAME"
+export META_SHA256=4e2bfbccd80b0d787223cc8fe36315e8b269514a28f6d7ffb8e6e1f855e6e92b
+
+mkdir -p "$META_DIR"
+curl -fL --retry 3 --retry-delay 2 \
+  -o "$META_ZIP.part" "$META_URL"
+mv "$META_ZIP.part" "$META_ZIP"
+
+printf '%s  %s\n' "$META_SHA256" "$META_ZIP" | sha256sum -c -
+unzip -tq "$META_ZIP"
+unzip -p "$META_ZIP" module.prop
 ```
 
-The result must identify Magic Mount. If it reports OverlayFS, return to the
-Manager, change the setting, and do not continue until the setting is saved.
+The release ZIP deliberately contains `metamodule=0`; its verified installer
+changes that property to `metamodule=1` while installing. Copy it into ReDroid,
+install it, and confirm the staged property:
+
+```bash
+sudo docker cp "$META_ZIP" "$CONTAINER":/data/local/tmp/meta-mm.zip
+sudo docker exec "$CONTAINER" \
+  /data/adb/ksud module install /data/local/tmp/meta-mm.zip
+
+sudo docker exec "$CONTAINER" sh -c '
+  cat /data/adb/modules_update/meta-mm/module.prop |
+    grep -Fx metamodule=1
+'
+sudo docker exec "$CONTAINER" rm -f /data/local/tmp/meta-mm.zip
+```
+
+KernelSU init hooks run at host boot in this deployment. Confirm the custom
+kernel is the saved GRUB entry and perform the first host reboot:
+
+```bash
+test "$(uname -r)" = 6.8.12-zksu
+sudo grub-editenv list
+sudo reboot
+```
+
+After reconnecting, wait for Android and verify the metamodule. `Installed` is
+the expected result:
+
+```bash
+test "$(uname -r)" = 6.8.12-zksu
+adb connect 127.0.0.1:5555
+adb -s 127.0.0.1:5555 wait-for-device
+test "$(adb -s 127.0.0.1:5555 shell getprop sys.boot_completed | tr -d '\r')" = 1
+
+sudo docker exec "$CONTAINER" /data/adb/ksud module metamodule
+sudo docker exec "$CONTAINER" sh -c \
+  'grep -F "Magic Mount Completed Successfully" /data/adb/magic_mount/mm.log'
+```
 
 ### 12.4 Download and verify the pinned Android 14 ARM64 package
 
@@ -1023,16 +1072,29 @@ responsible for the applicable licence and Google terms.
 
 ### 12.5 Install LiteGapps as a KernelSU module
 
-Push the verified ZIP into Android and install it with the same pinned `ksud`
+KernelSU extracts module payloads under `/dev/tmp`. Docker creates ReDroid's
+`/dev` as a 64 MiB tmpfs by default, but this LiteGapps package expands to about
+316 MB. Without raising the limit, its installer misleadingly finishes after
+GNU tar reports `No space left on device`, leaving truncated GMS and Play Store
+APKs. Temporarily enlarge the tmpfs; memory is consumed only by files actually
+written, and the normal 64 MiB setting returns at the next container start:
+
+```bash
+sudo docker exec "$CONTAINER" mount -o remount,size=768M /dev
+sudo docker exec "$CONTAINER" df -h /dev
+```
+
+Copy the verified ZIP into Android and install it with the same pinned `ksud`
 used for the other modules:
 
 ```bash
-adb -s "$ADB_SERIAL" push "$GAPPS_ZIP" /data/local/tmp/litegapps.zip
+sudo docker cp "$GAPPS_ZIP" "$CONTAINER":/data/local/tmp/litegapps.zip
+sudo docker exec "$CONTAINER" sha256sum /data/local/tmp/litegapps.zip
 
 sudo docker exec "$CONTAINER" \
   /data/adb/ksud module install /data/local/tmp/litegapps.zip
 
-adb -s "$ADB_SERIAL" shell rm -f /data/local/tmp/litegapps.zip
+sudo docker exec "$CONTAINER" rm -f /data/local/tmp/litegapps.zip
 sudo docker exec "$CONTAINER" /data/adb/ksud module list
 
 sudo docker exec "$CONTAINER" sh -c '
@@ -1041,8 +1103,21 @@ sudo docker exec "$CONTAINER" sh -c '
 '
 ```
 
-The module list must contain `litegapps`. Stop if installation reports an
-architecture, SDK, space, mount, or permission error.
+The module list must contain `litegapps`. Its staged directory should be about
+305 MB, and the two largest APKs must not be empty or truncated:
+
+```bash
+sudo docker exec "$CONTAINER" du -sh \
+  /data/adb/modules_update/litegapps
+sudo docker exec "$CONTAINER" stat -c '%n %s bytes' \
+  /data/adb/modules_update/litegapps/system/product/priv-app/GmsCore/GmsCore.apk \
+  /data/adb/modules_update/litegapps/system/product/priv-app/Phonesky/Phonesky.apk
+```
+
+For the pinned release, the expected sizes are `225469269` and `76478510`
+bytes. Stop and remove only `/data/adb/modules_update/litegapps` if installation
+reports an architecture, SDK, space, mount, extraction, or permission error. Do
+not reboot an incomplete staged module.
 
 ### 12.6 Reboot the host—not only Android
 
@@ -1145,9 +1220,57 @@ References:
 - [Google: uncertified/custom-ROM device registration](https://www.google.com/android/uncertified/)
 
 If registration is offered, submit the **Google Services Framework ID** shown
-by a trusted device-ID tool—not the ordinary Android Settings ID. Registration
-can take time and is not a promise that a rooted cloud instance will become
-certified or pass integrity checks.
+by a trusted device-ID tool—not the ordinary Android Settings ID. The ID can be
+read directly from GSF's `gservices.db`; no third-party Android application is
+needed.
+
+The Android-side `/bin/sqlite3` included in this ReDroid image can abort while
+opening this database. Copy the database to Ubuntu and use the host SQLite
+implementation instead:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y sqlite3
+
+GSF_TMP_DIR=$(mktemp -d)
+trap 'sudo rm -rf "$GSF_TMP_DIR"' EXIT
+
+sudo docker cp \
+  redroid14-ksu:/data/data/com.google.android.gsf/databases/gservices.db \
+  "$GSF_TMP_DIR/gservices.db"
+
+GSF_DECIMAL=$(sudo sqlite3 -readonly "$GSF_TMP_DIR/gservices.db" \
+  "SELECT value FROM main WHERE name='android_id';")
+
+case "$GSF_DECIMAL" in
+  ''|*[!0-9]*)
+    echo "GSF Android ID was not generated or is invalid" >&2
+    exit 1
+    ;;
+esac
+
+GSF_HEX=$(printf '%016x' "$GSF_DECIMAL")
+printf 'GSF Android ID (decimal): %s\n' "$GSF_DECIMAL"
+printf 'GSF Android ID (hex):     %s\n' "$GSF_HEX"
+
+sudo rm -rf "$GSF_TMP_DIR"
+trap - EXIT
+```
+
+Submit the 16-character hexadecimal value printed as `GSF_HEX` at
+[Google's uncertified-device registration portal](https://www.google.com/android/uncertified/).
+Do not submit `Settings.Secure.ANDROID_ID`; that is a different identifier.
+After registration, wait several minutes and perform a host reboot:
+
+```bash
+sudo reboot
+```
+
+Do not clear Google Services Framework storage, replace the persistent
+`/home/ubuntu/redroid14-data` directory, or regenerate Android data after
+registering. Those operations can create a different GSF ID, making the
+registered value stale. Registration can take time and is not a promise that a
+rooted cloud instance will become certified or pass Play Integrity.
 
 ### 12.9 Disable LiteGapps if Android becomes unstable
 
@@ -1257,6 +1380,8 @@ known-good boot first.
 - Do not republish bundled third-party binaries without checking their licenses.
 - Do not install LiteGapps over an image that already contains GApps.
 - Do not use an ARM, x86, or non-Android-14 GApps package on this ARM64/API-34 image.
-- Do not activate a systemless GApps package with OverlayFS; select Magic Mount.
+- Do not install a system-changing KernelSU module without an active metamodule.
+- Do not ignore `No space left on device` from LiteGapps merely because its
+  installer later prints success; enlarge ReDroid's `/dev` tmpfs and reinstall.
 - Do not assume Play Store presence means Play Protect certification or Play Integrity.
 - Do not use `adb reboot` or `docker restart` to activate a new KernelSU module here.

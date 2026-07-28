@@ -81,11 +81,11 @@
 
 | Guard | Value | Why |
 |---|---:|---|
-| CPU quota | 1 CPU | Leaves one VPS CPU available for SSH, Docker, and recovery |
-| RAM limit | 6 GiB | Prevents Redroid from exhausting the 11.65 GiB host |
-| RAM + swap limit | 8 GiB | Allows a buffer without giving the container unlimited swap |
-| Hard task limit | 1,536 | Kernel-enforced cgroup backstop |
-| Watchdog trip | 1,400 tasks | Kills a runaway before the hard cap is saturated |
+| CPU quota | 1.5 CPUs | Leaves half a VPS CPU available for SSH and recovery |
+| RAM limit | 8 GiB | Leaves roughly 3.65 GiB of host RAM outside ReDroid |
+| RAM + swap limit | 10 GiB | Allows up to 2 GiB swap without giving the container unlimited swap |
+| Hard task limit | 8,192 | Kernel-enforced cgroup backstop |
+| Watchdog trip | 7,000 tasks | Kills a runaway before the hard cap is saturated |
 | Restart policy | `no` | A crash cannot become an automatic crash loop |
 | Android `/dev/kmsg` | mapped to `/dev/null` | Android logs cannot flood the host journal or serial console |
 | Docker log rotation | 50 MiB × 2 | Prevents unbounded container logs |
@@ -167,7 +167,7 @@ Skipping step 3 caused the most confusing failure in this project. A character d
 | [deploy_redroid14_v2.sh](vps/deploy_redroid14_v2.sh) | Performs preflight checks, creates the bounded container, boots Android, installs the root assets, and stages modules |
 | [redroid14_watchdog_v2.sh](vps/redroid14_watchdog_v2.sh) | Reads `pids.current` directly and kills the container init PID at the guard threshold |
 | [redroid14.service](vps/redroid14.service) | Starts the existing container once after Docker and binder are ready |
-| [redroid14-watchdog.service](vps/redroid14-watchdog.service) | Runs the permanent 1,400-task watchdog |
+| [redroid14-watchdog.service](vps/redroid14-watchdog.service) | Runs the permanent 3,200-task watchdog |
 | [validate_redroid14.sh](vps/validate_redroid14.sh) | Verifies boot, OOM state, root assets, module activation, Manager package, and services |
 | [redroid14-validate.service](vps/redroid14-validate.service) | Runs the validator after Redroid/watchdog startup and remains `active (exited)` on success |
 | [monitor_redroid14_10m.sh](vps/monitor_redroid14_10m.sh) | Takes 11 one-minute samples of CPU, RAM, tasks, PSI, watchdog, and kernel faults |
@@ -1091,10 +1091,10 @@ sudo docker create \
   --name redroid14-ksu \
   --privileged \
   --restart=no \
-  --pids-limit=1536 \
-  --memory=6g \
-  --memory-swap=8g \
-  --cpus=1 \
+  --pids-limit=8192 \
+  --memory=8g \
+  --memory-swap=10g \
+  --cpus=1.5 \
   --stop-timeout=10 \
   --log-driver=json-file \
   --log-opt max-size=50m \
@@ -1120,10 +1120,13 @@ sudo docker create \
 2. Reads its cgroup membership.
 3. Locates `pids.current` for cgroup v1 or v2.
 4. Records every 100-task milestone and the peak.
-5. Sends `SIGKILL` directly to the container init PID at 1,400 tasks.
+5. Sends `SIGKILL` directly to the container init PID at 7,000 tasks.
 6. Optionally enforces a boot deadline.
 
-The hard cgroup limit remains 1,536 even if Docker commands become slow.
+The hard cgroup limit remains 8,192 even if Docker commands become slow. The
+original bare-ReDroid limits were 1,400/1,536; LiteGapps first boot exceeded the
+soft limit with legitimate Google services, so both limits were raised while
+retaining containment below the old 8,230-task failure mode.
 
 ## 13.6 First boot gate
 
@@ -1194,10 +1197,13 @@ Measured healthy values:
 
 ## 14.3 Evidence-based replacement
 
-- Permanent watchdog: 1,400.
-- Hard cgroup limit: 1,536.
+- Permanent watchdog: 7,000.
+- Hard cgroup limit: 8,192.
 
-This leaves roughly 35–45% headroom above the stable/module-boot range but stops the previous 8,230-task failure mode far earlier.
+The earlier 1,400/1,536 pair was validated for the root-only stack. It was too
+small after GApps added Google Play services and deliberately killed a healthy
+container at 1,403 tasks. The revised pair leaves room for modding work but
+still trips before the previous 8,230-task failure reaches the hard cap.
 
 Evidence: [redroid14-watchdog.log](artifacts/kernel-build/logs/vps-diagnostics/redroid14-watchdog.log) and [redroid14-binder-fixed-pre-guard-inspect.json](artifacts/kernel-build/logs/vps-diagnostics/redroid14-binder-fixed-pre-guard-inspect.json).
 
@@ -1362,7 +1368,7 @@ ExecStop=-/usr/bin/docker stop --time 10 redroid14-ksu
 [redroid14-watchdog.service](vps/redroid14-watchdog.service) attaches after Redroid and runs indefinitely:
 
 ```ini
-ExecStart=/usr/local/sbin/redroid14-watchdog redroid14-ksu 1400 0
+ExecStart=/usr/local/sbin/redroid14-watchdog redroid14-ksu 7000 0
 Restart=on-success
 RestartSec=1
 ```

@@ -10,8 +10,10 @@ ARTIFACT_DIR=/home/ubuntu/kbuild/artifacts/android
 ADB_SERIAL=127.0.0.1:5555
 WATCHDOG_UNIT=redroid14-watchdog.service
 WATCHDOG=/usr/local/sbin/redroid14-watchdog
-PIDS_LIMIT=1536
-WATCHDOG_PIDS=1400
+# GApps/Play Services can legitimately exceed 1,400 Android tasks during boot.
+# Keep a generous Docker hard cap and trip the soft watchdog below that cap.
+PIDS_LIMIT=8192
+WATCHDOG_PIDS=7000
 BOOT_WAIT_SECONDS=210
 WATCHDOG_SECONDS=240
 
@@ -129,9 +131,9 @@ sudo docker create \
   --privileged \
   --restart=no \
   --pids-limit="$PIDS_LIMIT" \
-  --memory=6g \
-  --memory-swap=8g \
-  --cpus=1 \
+  --memory=8g \
+  --memory-swap=10g \
+  --cpus=1.5 \
   --stop-timeout=10 \
   --log-driver=json-file \
   --log-opt max-size=50m \

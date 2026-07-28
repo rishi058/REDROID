@@ -6,7 +6,7 @@ PartOf=redroid14.service
 
 [Service]
 Type=exec
-ExecStart=/usr/local/sbin/redroid14-watchdog redroid14-ksu 1400 0
+ExecStart=/usr/local/sbin/redroid14-watchdog redroid14-ksu 7000 0
 Restart=on-success
 RestartSec=1
 TimeoutStopSec=10

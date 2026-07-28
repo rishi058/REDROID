@@ -1,6 +1,6 @@
 # Redroid 14 + KernelSU Deployment Record
 
-Validated on 2026-07-27 against VPS `YOUR_VPS_PUBLIC_IP`.
+Validated on 2026-07-28 against VPS `YOUR_VPS_PUBLIC_IP`.
 
 ## Installed stack
 
@@ -13,9 +13,9 @@ Validated on 2026-07-27 against VPS `YOUR_VPS_PUBLIC_IP`.
 ## Host containment
 
 - Container restart policy: `no`; systemd starts it once after Docker and binderfs are ready.
-- CPU: 1 of the 2 VPS CPUs during normal operation.
-- Memory: 6 GiB hard RAM limit; 8 GiB combined RAM+swap limit.
-- Tasks: 1,536 hard cgroup limit; permanent watchdog kills at 1,400.
+- CPU: 1.5 of the 2 VPS CPUs during normal operation.
+- Memory: 8 GiB hard RAM limit; 10 GiB combined RAM+swap limit.
+- Tasks: 8,192 hard cgroup limit; permanent watchdog kills at 7,000.
 - ADB: `127.0.0.1:5555` only.
 - Binder: the three binderfs device inodes are explicitly bind-mounted.
 - Android `/dev/kmsg`: mapped to `/dev/null` so Android log storms cannot flood the host journal/serial console.
@@ -25,7 +25,11 @@ Validated on 2026-07-27 against VPS `YOUR_VPS_PUBLIC_IP`.
 
 The failed containers used recreated Binder device nodes. Binderfs device state is attached to the binderfs inode, so the look-alike nodes returned `ENXIO`. Android repeatedly restarted `servicemanager` and related services. Redroid redirects init output to `/dev/kmsg`; this produced bursts near 400 host journal lines per second. There was no host OOM, kernel panic, or hung task in those incidents.
 
-Exit 137 in the later canary was the original 600-task watchdog sending `SIGKILL`; Docker counts Android threads in PIDS. A clean boot peaked at 684 tasks and the module-enabled boot peaked at 1,028, which is why the verified watchdog/hard-cap pair is now 1,400/1,536.
+Exit 137 in the later canary was the original 600-task watchdog sending
+`SIGKILL`; Docker counts Android threads in PIDS. The root-only stack later used
+1,400/1,536, but a healthy LiteGapps first boot reached 1,403 tasks and was
+mistakenly killed. The modding-friendly watchdog/hard-cap pair is therefore
+7,000/8,192, still below the prior runaway workload of about 8,230 tasks.
 
 ## Operations
 

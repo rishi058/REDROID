@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 CONTAINER=${1:-redroid14-ksu}
-MAX_PIDS=${2:-1400}
+MAX_PIDS=${2:-7000}
 MAX_SECONDS=${3:-240}
 LOG_FILE=${4:-/home/ubuntu/kbuild/artifacts/logs/redroid14-watchdog.log}
 

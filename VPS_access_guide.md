@@ -27,3 +27,13 @@ icacls.exe "C:/Users/YOUR_WINDOWS_USER/.ssh/YOUR_PRIVATE_KEY.key" /grant:r "$($e
 ssh -i "oracle.key" ubuntu@YOUR_PUBLIC_IP
 
 ssh -i "C:/Users/YOUR_WINDOWS_USER/.ssh/YOUR_PRIVATE_KEY.key" -o StrictHostKeyChecking=no ubuntu@YOUR_VPS_PUBLIC_IP
+
+
+# Connecting PORT 
+
+ssh -i "C:/Users/Rishi/.ssh/ssh-key-2026-07-06(pvt).key" `
+  -o ExitOnForwardFailure=yes `
+  -o ServerAliveInterval=30 `
+  -N `
+  -L 127.0.0.1:5555:127.0.0.1:5555 `
+  ubuntu@141.148.151.172
