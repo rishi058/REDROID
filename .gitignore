@@ -1,0 +1,26 @@
+# Local credentials and machine-specific access notes
+*.key
+*.pem
+*.ppk
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+.env
+.env.*
+!.env.example
+
+# Generated build output and diagnostics
+**/logs/
+*.log
+*.img
+*.tar
+*.tar.gz
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

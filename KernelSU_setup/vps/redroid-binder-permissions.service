@@ -1,0 +1,16 @@
+[Unit]
+Description=Set Redroid binder device permissions
+After=systemd-modules-load.service dev-binderfs.mount binder-bindmounts.service
+Requires=dev-binderfs.mount binder-bindmounts.service
+Before=docker.service
+ConditionPathExists=/dev/binder
+ConditionPathExists=/dev/hwbinder
+ConditionPathExists=/dev/vndbinder
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/chmod 0666 /dev/binderfs/binder /dev/binderfs/hwbinder /dev/binderfs/vndbinder /dev/binder /dev/hwbinder /dev/vndbinder
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

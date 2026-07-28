@@ -1,0 +1,13 @@
+[Unit]
+Description=Validate Redroid 14 after host boot
+After=redroid14-watchdog.service
+Requires=redroid14-watchdog.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/validate-redroid14
+TimeoutStartSec=240
+
+[Install]
+WantedBy=multi-user.target

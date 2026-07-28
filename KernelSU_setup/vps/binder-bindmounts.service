@@ -1,0 +1,15 @@
+[Unit]
+Description=Bind mount binderfs devices to /dev
+After=dev-binderfs.mount
+Requires=dev-binderfs.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/bin/touch /dev/binder /dev/hwbinder /dev/vndbinder
+ExecStart=/usr/bin/mount --bind /dev/binderfs/binder /dev/binder
+ExecStart=/usr/bin/mount --bind /dev/binderfs/hwbinder /dev/hwbinder
+ExecStart=/usr/bin/mount --bind /dev/binderfs/vndbinder /dev/vndbinder
+
+[Install]
+WantedBy=multi-user.target

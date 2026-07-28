@@ -1,0 +1,15 @@
+[Unit]
+Description=Permanent Redroid 14 task-count watchdog
+After=redroid14.service
+Requires=redroid14.service
+PartOf=redroid14.service
+
+[Service]
+Type=exec
+ExecStart=/usr/local/sbin/redroid14-watchdog redroid14-ksu 1400 0
+Restart=on-success
+RestartSec=1
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

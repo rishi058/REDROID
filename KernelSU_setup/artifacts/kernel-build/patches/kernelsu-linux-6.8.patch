@@ -1,0 +1,51 @@
+diff --git a/kernel/hook/lsm_hook.c b/kernel/hook/lsm_hook.c
+index 4598c6bc..fec0d5b5 100644
+--- a/kernel/hook/lsm_hook.c
++++ b/kernel/hook/lsm_hook.c
+@@ -343,7 +343,7 @@ int ksu_lsm_hook(struct ksu_lsm_hook *hook)
+                     hook->list.head = head;
+                     hook->list.list.next = NULL;
+                     hook->list.list.pprev = &head->first;
+-                    hook->list.lsm = "ksu";
++                    // hook->list.lsm = "ksu";
+                     *(void **)((char *)selected_entry + hook->hook_offset) = hook->replacement;
+                     selected_slot = (void **)&head->first;
+                     selected_origin = NULL;
+diff --git a/kernel/selinux/selinux.c b/kernel/selinux/selinux.c
+index 88c79568..cc440041 100644
+--- a/kernel/selinux/selinux.c
++++ b/kernel/selinux/selinux.c
+@@ -99,11 +99,11 @@ struct lsm_context {
+ 
+ static int __security_secid_to_secctx(u32 secid, struct lsm_context *cp)
+ {
+-    return security_secid_to_secctx(secid, &cp->context, &cp->len);
++    return security_secid_to_secctx(secid, (struct lsmcontext *)cp);
+ }
+ static void __security_release_secctx(struct lsm_context *cp)
+ {
+-    security_release_secctx(cp->context, cp->len);
++    security_release_secctx((struct lsmcontext *)cp);
+ }
+ #else
+ #define __security_secid_to_secctx security_secid_to_secctx
+diff --git a/kernel/selinux/sepolicy.c b/kernel/selinux/sepolicy.c
+index d12fe6df..39d1e070 100644
+--- a/kernel/selinux/sepolicy.c
++++ b/kernel/selinux/sepolicy.c
+@@ -982,6 +982,7 @@ struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)
+     if (len >= kConfigOff + sizeof(u32)) {
+         u32 *config_ptr = (u32 *)((unsigned long)data + kConfigOff);
+         pr_info("old config: %u\n", *config_ptr);
++#ifdef POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE
+         if (old_pol->policydb.android_netlink_route) {
+             pr_info("adding POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE\n");
+             *config_ptr |= POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE;
+@@ -990,6 +991,7 @@ struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)
+             pr_info("adding POLICYDB_CONFIG_ANDROID_NETLINK_GETNEIGH\n");
+             *config_ptr |= POLICYDB_CONFIG_ANDROID_NETLINK_GETNEIGH;
+         }
++#endif
+         pr_info("new config: %u\n", *config_ptr);
+     }
+ 

@@ -1,0 +1,19 @@
+diff --git a/kernel/hook/arm64/patch_memory.c b/kernel/hook/arm64/patch_memory.c
+index d351a3f9..d7763088 100644
+--- a/kernel/hook/arm64/patch_memory.c
++++ b/kernel/hook/arm64/patch_memory.c
+@@ -99,10 +99,12 @@ unsigned long phys_from_virt(unsigned long addr, int *err)
+         unsigned long __end = __start + (sz);                                  \
+         dcache_clean_inval_poc(__start, __end);                                \
+     })
+-#define ksu_flush_icache(start, end) caches_clean_inval_pou
++#define ksu_flush_icache(start, end)                                           \
++    caches_clean_inval_pou((start), (end))
+ #else
+ #define ksu_flush_dcache(start, sz) __flush_dcache_area((void *)start, sz)
+-#define ksu_flush_icache(start, end) __flush_icache_range
++#define ksu_flush_icache(start, end)                                           \
++    __flush_icache_range((start), (end))
+ #endif
+ 
+ struct patch_text_info {

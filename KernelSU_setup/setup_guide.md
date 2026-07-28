@@ -1,0 +1,967 @@
+# Fast Setup Guide: ReDroid 14 + KernelSU-Next + Zygisk Next + LSPosed
+
+This is the command-first installation guide. The default path uses the
+already-built kernel packages and the automation in [`vps/`](vps/). A detailed
+WSL2 cross-build fallback is included for cases where those packages are absent.
+
+For the reasoning, failures, fixes, build history, and detailed explanations,
+read [`my_setup_journey.md`](my_setup_journey.md).
+
+## What this installs
+
+- Ubuntu ARM64 kernel `6.8.12-zksu` with KernelSU-Next support
+- ReDroid 14 container `redroid14-ksu`
+- KernelSU Manager
+- Zygisk Next
+- LSPosed
+- Persistent Binder devices
+- Bounded Docker resources and log rotation
+- A watchdog, boot validator, and ten-minute stability monitor
+
+Expected fast-path time: about 20–40 minutes plus the optional ten-minute
+stability check. If a laptop build is required, allow roughly another 20–90
+minutes depending on its CPU, RAM, SSD, cooling, and source-transfer time.
+
+## Assumptions
+
+This guide expects:
+
+- an Ubuntu ARM64 VPS using 4 KiB memory pages;
+- SSH access as the `ubuntu` user;
+- at least 4 GiB available RAM and 5 GiB free under `/home`;
+- at least 300 MiB free in `/boot`;
+- this repository on a Windows machine;
+- when using the fast path, the packaged files in [`artifacts/`](artifacts/)
+  have not been modified.
+
+Commands marked **Windows PowerShell** run locally. Commands in the laptop-build
+fallback run inside Ubuntu WSL2 where stated. All remaining commands run on the
+VPS.
+
+Replace these placeholders:
+
+```text
+C:/path/to/private-key.key
+SERVER_IP
+```
+
+Do not expose Docker/ADB port `5555` publicly. The container binds ADB only to
+`127.0.0.1`; use the SSH tunnel near the end of this guide.
+
+---
+
+## 0. Download fallback Android assets when needed
+
+The repository includes pinned fallback assets for the Android root stack. If
+the files under `KernelSU_setup/artifacts/android/` are missing, download them
+from the original publisher release URLs with **Windows PowerShell**:
+
+```powershell
+$AndroidDir = ".\KernelSU_setup\artifacts\android"
+$ProgressPreference = "SilentlyContinue"
+New-Item -ItemType Directory -Force $AndroidDir | Out-Null
+
+$Assets = @(
+  @{
+    Name = "KernelSU_Next_v3.3.0_33214-release.apk"
+    Url = "https://github.com/KernelSU-Next/KernelSU-Next/releases/download/v3.3.0/KernelSU_Next_v3.3.0_33214-release.apk"
+    Sha256 = "fd0b12385c98fe9d5f4f1257b5f184e55c74c1376637507df0718305f5d7a924"
+  },
+  @{
+    Name = "ksud-aarch64-linux-android"
+    Url = "https://github.com/KernelSU-Next/KernelSU-Next/releases/download/v3.3.0/ksud-aarch64-linux-android"
+    Sha256 = "527fa426c20b312f62adbd1a8baaf47fb8fd170677b1bc6427cbcd8a16ff0ee5"
+  },
+  @{
+    Name = "Zygisk-Next-1.4.3-817-e815170-release.zip"
+    Url = "https://github.com/Dr-TSNG/ZygiskNext/releases/download/v1.4.3/Zygisk-Next-1.4.3-817-e815170-release.zip"
+    Sha256 = "82fb9176037771a9ed4f6a530581c7826460dbc19ca5a6908b95c60b86903858"
+  },
+  @{
+    Name = "LSPosed-v1.9.2-7024-zygisk-release.zip"
+    Url = "https://github.com/LSPosed/LSPosed/releases/download/v1.9.2/LSPosed-v1.9.2-7024-zygisk-release.zip"
+    Sha256 = "0ebc6bcb465d1c4b44b7220ab5f0252e6b4eb7fe43da74650476d2798bb29622"
+  }
+)
+
+foreach ($Asset in $Assets) {
+  $Path = Join-Path $AndroidDir $Asset.Name
+  if (-not (Test-Path $Path)) {
+    Write-Host "Downloading $($Asset.Name)"
+    Invoke-WebRequest -Uri $Asset.Url -OutFile $Path
+  }
+
+  $Actual = (Get-FileHash $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ($Actual -ne $Asset.Sha256) {
+    throw "SHA-256 mismatch for $($Asset.Name): expected $($Asset.Sha256), got $Actual"
+  }
+  Write-Host "Verified $($Asset.Name)"
+}
+```
+
+These are fallback versions, not replacements for checking newer upstream
+releases. If you update one, update its URL and SHA-256 together. The matching
+manifest is [`artifacts/android/SHA256SUMS`](artifacts/android/SHA256SUMS).
+
+The two kernel `.deb` files are different: they are produced by the kernel
+build steps below or copied from the prepared build output. They are not
+downloaded from the Android release pages.
+
+---
+
+## 0. Choose the kernel-package approach
+
+Check for the two ARM64 packages in **Windows PowerShell**:
+
+```powershell
+$PackageDir = ".\KernelSU_setup\artifacts\kernel-build\packages"
+Get-ChildItem $PackageDir -Filter "linux-*6.8.12-zksu*arm64.deb" `
+  -ErrorAction SilentlyContinue
+
+if (Test-Path "$PackageDir\SHA256SUMS") {
+  Get-Content "$PackageDir\SHA256SUMS"
+} else {
+  Write-Host "SHA256SUMS is absent; use the laptop-build fallback."
+}
+```
+
+Choose one path:
+
+- If both `linux-image` and `linux-headers` packages exist, use them and skip to
+  [Step 1](#1-upload-the-prepared-files). This is the recommended fast path.
+- If either package is absent, build both on the laptop using the procedure
+  below, then return to Step 1.
+
+Do not download `/boot/vmlinuz-*` and try to patch it. That is an already-linked
+kernel binary. Kernel patches must be applied to a complete source tree.
+
+### 0.1 Laptop-build requirements
+
+The tested VPS is ARM64, while a typical Windows laptop is x86-64. Build inside
+Ubuntu WSL2 using an ARM64 cross-compiler.
+
+Recommended laptop resources:
+
+- 16 GiB RAM or more;
+- 30 GiB free inside the WSL2 Linux filesystem;
+- 8–10 build jobs on a 12-thread laptop, leaving capacity for Windows;
+- an SSD and AC power.
+
+Do not build the kernel under `/mnt/c`, `/mnt/d`, OneDrive, or another Windows
+mount. Linux kernel source relies on Linux permissions, symlinks, case behavior,
+and many small-file operations. Keep the source under `$HOME` in WSL2; only copy
+the final `.deb` files back to Windows.
+
+Install Ubuntu WSL2 from an elevated **Windows PowerShell** if it is not already
+installed:
+
+```powershell
+wsl --install -d Ubuntu-24.04
+```
+
+Restart Windows if requested, open Ubuntu, and install the build tools:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential crossbuild-essential-arm64 \
+  bc bison flex libssl-dev libelf-dev libncurses-dev libdw-dev \
+  dwarves fakeroot dpkg-dev debhelper rsync cpio kmod git time \
+  zstd lz4
+```
+
+Create the Linux-side workspace:
+
+```bash
+export BUILD_ROOT="$HOME/kbuild"
+mkdir -p "$BUILD_ROOT"/{vps,artifacts/{config,logs,packages}}
+mkdir -p "$HOME/.ssh"
+```
+
+Copy the private key into WSL's Linux filesystem. Replace the example key path:
+
+```bash
+install -m 0600 \
+  "/mnt/c/Users/YOUR_WINDOWS_USER/.ssh/YOUR_PRIVATE_KEY.key" \
+  "$HOME/.ssh/vps-build.key"
+```
+
+### 0.2 Copy the prepared source tree from the VPS
+
+The source is expected at:
+
+```text
+/home/ubuntu/kbuild/linux-6.8.0
+```
+
+Copy the directory with `rsync`. The trailing slashes are intentional:
+
+```bash
+export SERVER_IP="SERVER_IP"
+
+rsync -aH --info=progress2 \
+  -e "ssh -i $HOME/.ssh/vps-build.key -o StrictHostKeyChecking=accept-new" \
+  "ubuntu@$SERVER_IP:/home/ubuntu/kbuild/linux-6.8.0/" \
+  "$BUILD_ROOT/linux-6.8.0/"
+```
+
+This may transfer several gigabytes because it preserves the exact prepared
+source, nested KernelSU checkout, Debian metadata, and any existing build state.
+The copied build objects will be cleaned locally before cross-compilation.
+
+Copy the project inputs from the Windows checkout. Replace the repository path:
+
+```bash
+export REPO_WSL="/mnt/d/path/to/new-terabox"
+
+cp -a "$REPO_WSL/KernelSU_setup/vps/." "$BUILD_ROOT/vps/"
+cp -a \
+  "$REPO_WSL/KernelSU_setup/artifacts/kernel-build/config/." \
+  "$BUILD_ROOT/artifacts/config/"
+```
+
+Verify the source identity and pinned KernelSU commit:
+
+```bash
+export SOURCE_DIR="$BUILD_ROOT/linux-6.8.0"
+export KSU_COMMIT="d6a42fd9285c11b8e8e67bfe72a5050528006c00"
+
+test -x "$SOURCE_DIR/scripts/config"
+test -f "$SOURCE_DIR/debian/changelog"
+test -d "$SOURCE_DIR/KernelSU-Next/.git"
+test "$(git -C "$SOURCE_DIR/KernelSU-Next" rev-parse HEAD)" = "$KSU_COMMIT"
+
+head -n 1 "$SOURCE_DIR/debian/changelog"
+git -C "$SOURCE_DIR/KernelSU-Next" status --short
+```
+
+The expected source line is:
+
+```text
+linux-upstream (6.8.12-11) noble; urgency=low
+```
+
+The `status --short` output may show the already-applied KernelSU compatibility
+changes. Do not reset or discard them.
+
+If the source directory no longer exists on the VPS, reconstruct the exact
+source and KernelSU checkout using Part 6 of
+[`my_setup_journey.md`](my_setup_journey.md). Do not substitute a random
+`latest` kernel or KernelSU branch.
+
+### Why this guide does not use the upstream one-line setup command
+
+The older general rooting analysis documents this alternative:
+
+```bash
+curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+```
+
+That command is intended for integrating KernelSU-Next into a fresh kernel
+source checkout. It clones or updates the live `next` branch and edits the
+kernel `Makefile` and `Kconfig` automatically. This guide does not use it
+because this workflow already has a pinned KernelSU-Next commit, archived
+Linux 6.8 compatibility patches, and a known-good configuration. Running the
+one-line command here could replace the prepared checkout, pull unpinned
+changes, or bypass the required patches. Use it only for a deliberately
+separate fresh-source build after pinning and reviewing the exact revision.
+
+### 0.3 Apply the archived compatibility patches only when needed
+
+The copied VPS tree should normally already contain both fixes. The following
+function applies each patch only if it is not already present:
+
+```bash
+cd "$SOURCE_DIR/KernelSU-Next"
+
+apply_if_missing() {
+  local patch_file="$1"
+
+  if git apply --reverse --check "$patch_file" >/dev/null 2>&1; then
+    echo "Already applied: $patch_file"
+  elif git apply --check "$patch_file"; then
+    git apply "$patch_file"
+    echo "Applied: $patch_file"
+  else
+    echo "Patch is neither cleanly applicable nor already applied: $patch_file" >&2
+    return 1
+  fi
+}
+
+apply_if_missing "$BUILD_ROOT/vps/patches/kernelsu-arm64-cacheflush.patch"
+apply_if_missing "$BUILD_ROOT/vps/patches/kernelsu-selinux-unavailable.patch"
+
+git diff --check
+```
+
+Do not run `git apply` unconditionally. Applying the same fix twice can corrupt
+the source or produce a misleading partial patch.
+
+### 0.4 Restore and validate the known-good configuration
+
+Clean only the laptop copy, then restore the archived final config:
+
+```bash
+cd "$SOURCE_DIR"
+
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- clean
+rm -f KernelSU-Next/kernel/built-in.a
+
+cp "$BUILD_ROOT/artifacts/config/config.completed" .config
+
+make ARCH=arm64 \
+  CROSS_COMPILE=aarch64-linux-gnu- \
+  olddefconfig
+```
+
+Validate the essential contract:
+
+```bash
+required=(
+  CONFIG_DEBUG_INFO_NONE=y
+  CONFIG_KPROBES=y
+  CONFIG_EXT4_FS=y
+  CONFIG_OVERLAY_FS=y
+  CONFIG_KSU=y
+  CONFIG_ANDROID_BINDER_IPC=m
+  CONFIG_ANDROID_BINDERFS=m
+  CONFIG_NAMESPACES=y
+  CONFIG_PID_NS=y
+  CONFIG_NET_NS=y
+  CONFIG_CGROUPS=y
+  CONFIG_SECCOMP=y
+  CONFIG_PSI=y
+  CONFIG_MEMCG=y
+  CONFIG_CGROUP_PIDS=y
+  CONFIG_ARM64_4K_PAGES=y
+)
+
+for option in "${required[@]}"; do
+  grep -qx "$option" .config || {
+    echo "Required option missing: $option" >&2
+    exit 1
+  }
+done
+
+test "$(git -C KernelSU-Next rev-parse HEAD)" = "$KSU_COMMIT"
+
+release=$(make -s \
+  ARCH=arm64 \
+  CROSS_COMPILE=aarch64-linux-gnu- \
+  kernelrelease LOCALVERSION=-zksu)
+
+test "$release" = 6.8.12-zksu
+echo "$release"
+```
+
+The VPS-oriented [`prepare_kernel_v2.sh`](vps/prepare_kernel_v2.sh) documents
+the same configuration contract and early subtree gates, but do not execute it
+unchanged on the laptop. It has VPS-specific paths, user checks, swap handling,
+and incident-log cleanup.
+
+### 0.5 Run a small compatibility build first
+
+Catch patch or compiler problems before starting the full package build:
+
+```bash
+cd "$SOURCE_DIR"
+
+make -j1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- prepare
+make -j1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- security/selinux/
+make -j1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- drivers/kernelsu/
+```
+
+Do not continue if any command fails.
+
+### 0.6 Build ARM64 Debian packages on the laptop
+
+Use ten jobs initially on a 12-thread laptop. Reduce `JOBS` if Windows becomes
+unresponsive or the laptop thermally throttles:
+
+```bash
+cd "$SOURCE_DIR"
+export JOBS=10
+export BUILD_LOG="$BUILD_ROOT/artifacts/logs/laptop-cross-build-$(date -u +%Y%m%dT%H%M%SZ).log"
+set -o pipefail
+
+/usr/bin/time -v make -j"$JOBS" \
+  ARCH=arm64 \
+  CROSS_COMPILE=aarch64-linux-gnu- \
+  KBUILD_DEBARCH=arm64 \
+  bindeb-pkg LOCALVERSION=-zksu \
+  2>&1 | tee "$BUILD_LOG"
+```
+
+[`build_kernel_v2.sh`](vps/build_kernel_v2.sh) is the native two-core VPS
+equivalent. The laptop command retains its pinned commit, config, package, and
+hash expectations while adding the cross-compilation variables explicitly.
+
+### 0.7 Collect and verify the generated packages
+
+`bindeb-pkg` writes packages into the parent of the source directory:
+
+```bash
+find "$BUILD_ROOT" -maxdepth 1 -type f \
+  -name '*6.8.12-zksu*arm64.deb' -print
+
+mapfile -t image_packages < <(
+  find "$BUILD_ROOT" -maxdepth 1 -type f \
+    -name 'linux-image-6.8.12-zksu_*_arm64.deb' | sort
+)
+mapfile -t header_packages < <(
+  find "$BUILD_ROOT" -maxdepth 1 -type f \
+    -name 'linux-headers-6.8.12-zksu_*_arm64.deb' | sort
+)
+
+test "${#image_packages[@]}" -eq 1
+test "${#header_packages[@]}" -eq 1
+
+rm -f "$BUILD_ROOT/artifacts/packages/"*.deb \
+      "$BUILD_ROOT/artifacts/packages/SHA256SUMS"
+cp -a "${image_packages[0]}" "${header_packages[0]}" \
+  "$BUILD_ROOT/artifacts/packages/"
+
+cd "$BUILD_ROOT/artifacts/packages"
+
+for package in *.deb; do
+  test "$(dpkg-deb -f "$package" Architecture)" = arm64
+  dpkg-deb -f "$package" Package Version Architecture
+done
+
+sha256sum -- *.deb > SHA256SUMS
+sha256sum -c SHA256SUMS
+```
+
+Exactly one image package and one headers package must be present, both with
+`Architecture: arm64`.
+
+### 0.8 Copy the packages back to the Windows project
+
+Still inside WSL2:
+
+```bash
+export WINDOWS_PACKAGES="$REPO_WSL/KernelSU_setup/artifacts/kernel-build/packages"
+mkdir -p "$WINDOWS_PACKAGES"
+
+cp -a "$BUILD_ROOT/artifacts/packages/." "$WINDOWS_PACKAGES/"
+```
+
+Verify them again in **Windows PowerShell**:
+
+```powershell
+$PackageDir = ".\KernelSU_setup\artifacts\kernel-build\packages"
+Get-ChildItem "$PackageDir\*.deb" | Get-FileHash -Algorithm SHA256
+Get-Content "$PackageDir\SHA256SUMS"
+```
+
+The hashes printed by PowerShell must match `SHA256SUMS`. The files are now in
+the location expected by Step 1 and
+[`install_kernel_v2.sh`](vps/install_kernel_v2.sh).
+
+---
+
+## 1. Upload the prepared files
+
+Run from the repository root in **Windows PowerShell**:
+
+```powershell
+$Key = "C:/path/to/private-key.key"
+$Target = "ubuntu@SERVER_IP"
+
+ssh -i $Key $Target "mkdir -p /home/ubuntu/kbuild/artifacts/config /home/ubuntu/kbuild/artifacts/logs"
+scp -i $Key -r ".\KernelSU_setup\vps" "${Target}:/home/ubuntu/kbuild/"
+scp -i $Key -r ".\KernelSU_setup\artifacts\android" "${Target}:/home/ubuntu/kbuild/artifacts/"
+scp -i $Key -r ".\KernelSU_setup\artifacts\kernel-build\config" "${Target}:/home/ubuntu/kbuild/artifacts/"
+scp -i $Key -r ".\KernelSU_setup\artifacts\kernel-build\packages" "${Target}:/home/ubuntu/kbuild/artifacts/"
+```
+
+Connect:
+
+```powershell
+ssh -i $Key $Target
+```
+
+The remote layout must now be:
+
+```text
+/home/ubuntu/kbuild/
+|-- vps/
+`-- artifacts/
+    |-- android/
+    |-- config/
+    |-- logs/
+    `-- packages/
+```
+
+## 2. Run the host preflight
+
+```bash
+set -e
+
+test "$(id -un)" = ubuntu
+test "$(dpkg --print-architecture)" = arm64
+test "$(getconf PAGESIZE)" -eq 4096
+test -r /proc/pressure/memory
+
+free -h
+df -h / /boot /home/ubuntu
+nproc
+```
+
+Stop here if any `test` fails. These scripts and packages target the tested
+ARM64/4-KiB-page environment, not an x86 VPS or a 16-KiB-page ARM host.
+
+Install the runtime tools:
+
+```bash
+sudo apt-get update
+command -v docker >/dev/null || sudo apt-get install -y docker.io
+command -v adb >/dev/null || sudo apt-get install -y adb
+sudo systemctl enable --now docker
+sudo docker info >/dev/null
+```
+
+Add a 2 GiB emergency swap file only if the host has no active swap:
+
+```bash
+if ! swapon --show --noheadings | grep -q .; then
+  sudo fallocate -l 2G /swapfile
+  sudo chmod 600 /swapfile
+  sudo mkswap /swapfile
+  sudo swapon /swapfile
+  grep -q '^/swapfile ' /etc/fstab || \
+    echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+fi
+
+swapon --show
+```
+
+Keep kernel console noise bounded. The deployment script deliberately refuses
+an excessively noisy console because it previously contributed to host stress:
+
+```bash
+echo 'kernel.printk = 4 4 1 7' | sudo tee /etc/sysctl.d/90-redroid-console.conf
+sudo sysctl --system >/dev/null
+cat /proc/sys/kernel/printk
+```
+
+Verify the uploaded assets before installing anything:
+
+```bash
+cd /home/ubuntu/kbuild
+chmod 0755 vps/*.sh
+
+cd artifacts/packages
+sha256sum -c SHA256SUMS
+
+cd ../android
+sha256sum -c SHA256SUMS
+
+cd /home/ubuntu/kbuild
+```
+
+Every hash must report `OK`.
+
+## 3. Install the prebuilt KernelSU kernel
+
+Run the guarded installer
+[`install_kernel_v2.sh`](vps/install_kernel_v2.sh):
+
+```bash
+cd /home/ubuntu/kbuild
+./vps/install_kernel_v2.sh
+```
+
+The script verifies the package hashes and architecture, checks `/boot` space,
+installs the image and headers, creates initramfs, and updates GRUB. It does not
+change the default kernel and does not reboot.
+
+Confirm the files exist:
+
+```bash
+ls -lh /boot/vmlinuz-6.8.12-zksu \
+       /boot/initrd.img-6.8.12-zksu \
+       /boot/config-6.8.12-zksu
+```
+
+Find the **exact** GRUB menu path generated on this VPS:
+
+```bash
+sudo grep -E "^submenu |^menuentry " /boot/grub/grub.cfg
+```
+
+Copy the complete entry path for `6.8.12-zksu`. It will normally look like:
+
+```text
+Advanced options for Ubuntu>Ubuntu, with Linux 6.8.12-zksu
+```
+
+Use the string copied from your VPS, not the example:
+
+```bash
+CUSTOM_ENTRY='PASTE THE EXACT CUSTOM KERNEL ENTRY HERE'
+sudo grub-reboot "$CUSTOM_ENTRY"
+sudo grub-editenv list
+```
+
+The output must show `next_entry` pointing to the custom kernel. Reboot:
+
+```bash
+sudo reboot
+```
+
+Your SSH connection will close. Wait for the VPS to return, reconnect, then
+verify the running kernel before doing anything else:
+
+```bash
+uname -r
+test "$(uname -r)" = 6.8.12-zksu
+```
+
+Do not continue unless the test passes.
+
+## 4. Make Binder devices persistent
+
+The kernel deliberately has no default Binder device list. Persist both the
+module and its required device names:
+
+```bash
+echo 'binder_linux' | sudo tee /etc/modules-load.d/redroid-binder.conf
+echo 'options binder_linux devices=binder,hwbinder,vndbinder' | \
+  sudo tee /etc/modprobe.d/redroid-binder.conf
+
+sudo modprobe binder_linux devices=binder,hwbinder,vndbinder
+sudo install -d -m 0755 /dev/binderfs
+```
+
+Install the supplied Binder units:
+
+```bash
+cd /home/ubuntu/kbuild
+
+sudo install -m 0644 vps/dev-binderfs.mount \
+  /etc/systemd/system/dev-binderfs.mount
+sudo install -m 0644 vps/binder-bindmounts.service \
+  /etc/systemd/system/binder-bindmounts.service
+sudo install -m 0644 vps/redroid-binder-permissions.service \
+  /etc/systemd/system/redroid-binder-permissions.service
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now dev-binderfs.mount
+sudo systemctl enable --now binder-bindmounts.service
+sudo systemctl enable --now redroid-binder-permissions.service
+```
+
+Verify all three units and all three devices:
+
+```bash
+systemctl is-active dev-binderfs.mount \
+  binder-bindmounts.service \
+  redroid-binder-permissions.service
+
+ls -l /dev/binder /dev/hwbinder /dev/vndbinder
+stat -Lc '%n inode=%i mode=%a owner=%U:%G' \
+  /dev/binderfs/binder /dev/binder \
+  /dev/binderfs/hwbinder /dev/hwbinder \
+  /dev/binderfs/vndbinder /dev/vndbinder
+```
+
+Each `/dev/binderfs/...` node and its `/dev/...` partner must have the same
+inode number.
+
+## 5. Deploy ReDroid and stage root modules
+
+Install the watchdog command first because the deploy script starts it:
+
+```bash
+cd /home/ubuntu/kbuild
+sudo install -m 0755 vps/redroid14_watchdog_v2.sh \
+  /usr/local/sbin/redroid14-watchdog
+```
+
+Run [`deploy_redroid14_v2.sh`](vps/deploy_redroid14_v2.sh):
+
+```bash
+./vps/deploy_redroid14_v2.sh
+```
+
+The script performs its own safety checks, pulls the pinned ReDroid image,
+creates the bounded container, installs KernelSU Manager, stages `ksud`, and
+stages Zygisk Next and LSPosed.
+
+Its important Docker limits are already encoded in the script:
+
+```text
+CPU:                1 core
+Memory:             6 GiB
+Memory + swap:      8 GiB
+PIDs:               1536
+Restart policy:     no
+Docker log:         50 MiB x 2 files
+ADB host binding:   127.0.0.1:5555
+/dev/kmsg:          mapped to /dev/null
+```
+
+If the script refuses an existing `redroid14-ksu` container or a nonempty
+`/home/ubuntu/redroid14-data`, stop and inspect them. Do not blindly delete an
+older installation.
+
+Check the transient deployment:
+
+```bash
+sudo docker ps --filter name=redroid14-ksu
+adb connect 127.0.0.1:5555
+adb -s 127.0.0.1:5555 shell getprop sys.boot_completed
+```
+
+The last command must print `1`.
+
+## 6. Install the permanent service units
+
+```bash
+cd /home/ubuntu/kbuild
+
+sudo install -m 0755 vps/validate_redroid14.sh \
+  /usr/local/sbin/validate-redroid14
+sudo install -m 0755 vps/monitor_redroid14_10m.sh \
+  /usr/local/sbin/monitor-redroid14-10m
+
+sudo install -m 0644 vps/redroid14.service \
+  /etc/systemd/system/redroid14.service
+sudo install -m 0644 vps/redroid14-watchdog.service \
+  /etc/systemd/system/redroid14-watchdog.service
+sudo install -m 0644 vps/redroid14-validate.service \
+  /etc/systemd/system/redroid14-validate.service
+
+sudo systemctl daemon-reload
+sudo systemd-analyze verify \
+  /etc/systemd/system/dev-binderfs.mount \
+  /etc/systemd/system/binder-bindmounts.service \
+  /etc/systemd/system/redroid-binder-permissions.service \
+  /etc/systemd/system/redroid14.service \
+  /etc/systemd/system/redroid14-watchdog.service \
+  /etc/systemd/system/redroid14-validate.service
+
+sudo systemctl enable redroid14.service \
+  redroid14-watchdog.service \
+  redroid14-validate.service
+```
+
+Do not start a second watchdog manually. The deploy script already has a
+transient watchdog running; systemd takes ownership after the next reboot.
+
+## 7. Reboot once more to activate the root modules
+
+The first `grub-reboot` was one-shot and has already been consumed. Set another
+one-shot custom-kernel boot before this reboot, or the VPS may return to its
+stock kernel.
+
+Find and copy the entry again if this is a new SSH session:
+
+```bash
+sudo grep -E "^submenu |^menuentry " /boot/grub/grub.cfg
+CUSTOM_ENTRY='PASTE THE EXACT CUSTOM KERNEL ENTRY HERE'
+
+sudo grub-reboot "$CUSTOM_ENTRY"
+sudo grub-editenv list
+sudo reboot
+```
+
+Reconnect and run the final validator:
+
+```bash
+test "$(uname -r)" = 6.8.12-zksu
+
+systemctl is-active \
+  dev-binderfs.mount \
+  binder-bindmounts.service \
+  redroid-binder-permissions.service \
+  redroid14.service \
+  redroid14-watchdog.service
+
+sudo /usr/local/sbin/validate-redroid14
+```
+
+The validator checks the kernel, Binder topology, boot state, Docker policy,
+watchdog, root assets, Manager package, Zygisk Next, LSPosed, and recent OOM or
+kernel-failure signals.
+
+Useful status commands:
+
+```bash
+sudo systemctl status redroid14.service redroid14-watchdog.service --no-pager
+sudo journalctl -u redroid14.service -u redroid14-watchdog.service -b --no-pager
+sudo docker stats --no-stream redroid14-ksu
+sudo docker logs --tail 100 redroid14-ksu
+```
+
+## 8. Make the custom kernel the saved default
+
+Do this only after the final validator passes. Keep the stock kernel installed
+as the recovery path.
+
+```bash
+sudo grep -E "^submenu |^menuentry " /boot/grub/grub.cfg
+CUSTOM_ENTRY='PASTE THE EXACT CUSTOM KERNEL ENTRY HERE'
+
+sudo cp -a /etc/default/grub \
+  "/etc/default/grub.before-zksu.$(date +%s)"
+
+if grep -q '^GRUB_DEFAULT=' /etc/default/grub; then
+  sudo sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' /etc/default/grub
+else
+  echo 'GRUB_DEFAULT=saved' | sudo tee -a /etc/default/grub
+fi
+
+sudo update-grub
+sudo grub-set-default "$CUSTOM_ENTRY"
+sudo grub-editenv list
+```
+
+The output must show `saved_entry` set to the custom kernel.
+
+## 9. Run the ten-minute stability gate
+
+The setup is operational after the validator passes. This final monitor is
+strongly recommended before considering it stable:
+
+```bash
+sudo systemd-run \
+  --unit=redroid14-stability-check \
+  --collect \
+  --property=Type=exec \
+  /usr/local/sbin/monitor-redroid14-10m
+
+sudo journalctl -fu redroid14-stability-check
+```
+
+The monitor takes eleven samples about one minute apart and fails if the
+container stops, Android loses boot completion, the watchdog disappears, or a
+critical kernel event appears.
+
+After it finishes:
+
+```bash
+systemctl show redroid14-stability-check \
+  -p Result -p ExecMainStatus -p ActiveState -p SubState
+```
+
+Success is `Result=success` and `ExecMainStatus=0`.
+
+## 10. Connect ADB from Windows
+
+Keep this SSH tunnel open in one **Windows PowerShell** window:
+
+```powershell
+ssh -i "C:/path/to/private-key.key" `
+  -N -L 5555:127.0.0.1:5555 `
+  ubuntu@SERVER_IP
+```
+
+In a second PowerShell window:
+
+```powershell
+adb kill-server
+adb start-server
+adb connect 127.0.0.1:5555
+adb devices -l
+```
+
+Connect to `127.0.0.1:5555`, not `SERVER_IP:5555`. A public Oracle VCN rule for
+port 5555 is unnecessary and should be removed.
+
+## 11. Confirm KernelSU, Zygisk, and LSPosed
+
+```bash
+adb connect 127.0.0.1:5555
+
+adb -s 127.0.0.1:5555 shell su -c id
+adb -s 127.0.0.1:5555 shell su -c 'ls -la /data/adb/modules'
+adb -s 127.0.0.1:5555 shell su -c 'ps -A | grep -i zygisk'
+adb -s 127.0.0.1:5555 shell su -c 'logcat -d | grep -i -E "zygisk|lsposed" | tail -100'
+```
+
+KernelSU Manager and the LSPosed UI can then be opened inside Android. If
+Android asks for root authorization, approve only the apps you trust.
+
+---
+
+## Script reference
+
+| File | Use in this guide |
+|---|---|
+| [`install_kernel_v2.sh`](vps/install_kernel_v2.sh) | Validates and installs the prebuilt kernel packages. |
+| [`deploy_redroid14_v2.sh`](vps/deploy_redroid14_v2.sh) | Creates the bounded ReDroid container and stages root assets. |
+| [`redroid14_watchdog_v2.sh`](vps/redroid14_watchdog_v2.sh) | Stops the container when host safety thresholds are crossed. |
+| [`validate_redroid14.sh`](vps/validate_redroid14.sh) | Performs the final end-to-end validation. |
+| [`monitor_redroid14_10m.sh`](vps/monitor_redroid14_10m.sh) | Runs the ten-minute stability gate. |
+| [`dev-binderfs.mount`](vps/dev-binderfs.mount) | Mounts BinderFS on every boot. |
+| [`binder-bindmounts.service`](vps/binder-bindmounts.service) | Exposes the Binder nodes at the paths ReDroid expects. |
+| [`redroid-binder-permissions.service`](vps/redroid-binder-permissions.service) | Applies Binder permissions before Docker starts. |
+| [`redroid14.service`](vps/redroid14.service) | Starts the existing ReDroid container safely after boot. |
+| [`redroid14-watchdog.service`](vps/redroid14-watchdog.service) | Runs the watchdog under systemd. |
+| [`redroid14-validate.service`](vps/redroid14-validate.service) | Runs the validator after ReDroid boots. |
+
+The following are rebuild-only tools and are intentionally excluded from the
+fast path:
+
+| File | Purpose |
+|---|---|
+| [`prepare_kernel_v2.sh`](vps/prepare_kernel_v2.sh) | Prepares an already-populated kernel source tree for a controlled rebuild. |
+| [`build_kernel_v2.sh`](vps/build_kernel_v2.sh) | Builds and packages the pinned custom kernel. |
+| [`kernelsu-arm64-cacheflush.patch`](vps/patches/kernelsu-arm64-cacheflush.patch) | Fixes the Linux 6.8 ARM64 cache-flush invocation. |
+| [`kernelsu-selinux-unavailable.patch`](vps/patches/kernelsu-selinux-unavailable.patch) | Guards KernelSU when the host SELinux policy is unavailable. |
+
+Those rebuild scripts are not a fresh-server bootstrap: they expect the kernel
+source, `.config`, pinned KernelSU-Next checkout, and patches to already exist
+under `/home/ubuntu/kbuild`. Use the rebuild chapters in
+[`my_setup_journey.md`](my_setup_journey.md) instead of running them blindly.
+
+## Recovery commands
+
+### ReDroid fails but SSH still works
+
+```bash
+sudo systemctl disable --now \
+  redroid14-validate.service \
+  redroid14-watchdog.service \
+  redroid14.service
+
+sudo docker stop -t 20 redroid14-ksu || true
+sudo journalctl -b -p warning --no-pager
+```
+
+This does not delete the container or Android data.
+
+### Boot the stock kernel once
+
+List the exact GRUB entries, select the stock Ubuntu kernel entry, and schedule
+only the next boot:
+
+```bash
+sudo grep -E "^submenu |^menuentry " /boot/grub/grub.cfg
+STOCK_ENTRY='PASTE THE EXACT STOCK KERNEL ENTRY HERE'
+sudo grub-reboot "$STOCK_ENTRY"
+sudo grub-editenv list
+sudo reboot
+```
+
+Do not uninstall the custom or stock kernel during troubleshooting. Confirm a
+known-good boot first.
+
+## Do not
+
+- Do not rebuild the kernel when the verified prebuilt packages meet the target.
+- Do not run `prepare_kernel_v2.sh` on a fresh host; it is a rebuild-stage tool.
+- Do not use all host CPU/RAM for an unbounded kernel build or container.
+- Do not set the custom kernel as the permanent GRUB default before validation.
+- Do not forget the second one-shot `grub-reboot` before module activation.
+- Do not expose ADB `5555` to the internet; tunnel it through SSH.
+- Do not create another ad-hoc privileged container. The supplied deployment
+  already uses `--privileged` together with strict CPU, memory, PID, restart,
+  logging, Binder, ADB, and `/dev/kmsg` controls.
+- Do not enable Docker's `always` restart policy; systemd and the watchdog own recovery.
+- Do not map the host's real `/dev/kmsg` into ReDroid.
+- Do not delete an existing container or data directory merely because deployment refuses it.
+- Do not remove the stock Ubuntu kernel; it is the rollback path.
+- Do not republish bundled third-party binaries without checking their licenses.

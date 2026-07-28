@@ -1,0 +1,29 @@
+# VPS ACCESS
+
+    key path = C:/Users/YOUR_WINDOWS_USER/.ssh/YOUR_PRIVATE_KEY.key
+    env = ubuntu
+    instance ip = YOUR_VPS_PUBLIC_IP
+---
+## Restrict permissions (Windows)
+
+SSH refuses to use keys that are accessible by other users.
+Run:
+icacls.exe "oracle.key" /inheritance:r
+Then:
+icacls.exe "oracle.key" /grant:r "$($env:USERNAME):(R)"
+
+i.e 
+
+Run:
+icacls.exe "C:/Users/YOUR_WINDOWS_USER/.ssh/YOUR_PRIVATE_KEY.key" /inheritance:r
+Then:
+icacls.exe "C:/Users/YOUR_WINDOWS_USER/.ssh/YOUR_PRIVATE_KEY.key" /grant:r "$($env:USERNAME):(R)"
+
+> ONE TIME THING (ALREADY DONE)
+--- 
+
+## CMD to enter VPS 
+
+ssh -i "oracle.key" ubuntu@YOUR_PUBLIC_IP
+
+ssh -i "C:/Users/YOUR_WINDOWS_USER/.ssh/YOUR_PRIVATE_KEY.key" -o StrictHostKeyChecking=no ubuntu@YOUR_VPS_PUBLIC_IP

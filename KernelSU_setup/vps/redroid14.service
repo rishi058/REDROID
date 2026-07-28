@@ -1,0 +1,19 @@
+[Unit]
+Description=Redroid 14 KernelSU container
+Wants=network-online.target
+After=network-online.target docker.service redroid-binder-permissions.service
+Requires=docker.service redroid-binder-permissions.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/bin/test -c /dev/binderfs/binder
+ExecStartPre=/usr/bin/test -c /dev/binderfs/hwbinder
+ExecStartPre=/usr/bin/test -c /dev/binderfs/vndbinder
+ExecStart=/usr/bin/docker start redroid14-ksu
+ExecStop=-/usr/bin/docker stop --time 10 redroid14-ksu
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

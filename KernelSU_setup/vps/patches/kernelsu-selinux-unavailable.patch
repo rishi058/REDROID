@@ -1,0 +1,56 @@
+diff --git a/kernel/selinux/rules.c b/kernel/selinux/rules.c
+index ce4a2ee..5eea51d 100644
+--- a/kernel/selinux/rules.c
++++ b/kernel/selinux/rules.c
+@@ -42,7 +42,7 @@ static void reset_avc_cache()
+ 
+ void apply_kernelsu_rules()
+ {
+-    struct selinux_policy *pol, *old_pol = selinux_state.policy;
++    struct selinux_policy *pol, *old_pol;
+     struct policydb *db;
+ 
+     if (!getenforce()) {
+@@ -52,8 +52,14 @@ void apply_kernelsu_rules()
+     }
+ 
+     mutex_lock(&selinux_state.policy_mutex);
+-    backup_sepolicy =
+-        ksu_dup_sepolicy(rcu_dereference_protected(old_pol, lockdep_is_held(&selinux_state.policy_mutex)));
++    old_pol = rcu_dereference_protected(
++        selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex));
++    if (!old_pol) {
++        pr_info("SELinux policy unavailable, skipping rule injection\n");
++        goto out_unlock;
++    }
++
++    backup_sepolicy = ksu_dup_sepolicy(old_pol);
+     if (IS_ERR(backup_sepolicy)) {
+         pr_err("failed to create backup sepolicy: %ld\n", PTR_ERR(backup_sepolicy));
+         backup_sepolicy = NULL;
+@@ -75,8 +81,7 @@ void apply_kernelsu_rules()
+             }
+         }
+     }
+-    pol = ksu_dup_sepolicy(rcu_dereference_protected(
+-        old_pol, lockdep_is_held(&selinux_state.policy_mutex)));
++    pol = ksu_dup_sepolicy(old_pol);
+     if (IS_ERR(pol)) {
+         pr_err("failed to dup selinux_policy: %ld\n", PTR_ERR(pol));
+         goto out_unlock;
+diff --git a/kernel/selinux/sepolicy.c b/kernel/selinux/sepolicy.c
+index a9eeac8..ccf7d6e 100644
+--- a/kernel/selinux/sepolicy.c
++++ b/kernel/selinux/sepolicy.c
+@@ -958,6 +958,11 @@ struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)
+     void *data;
+     struct policy_file fp;
+ 
++    if (!old_pol) {
++        pr_err("sepolicy: no loaded SELinux policy\n");
++        return ERR_PTR(-EINVAL);
++    }
++
+     len = old_pol->policydb.len;
+     data = vmalloc(len);
+     if (!data) {
