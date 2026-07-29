@@ -25,6 +25,36 @@ Thumbs.db
 *.swp
 *.swo
 
-exp 
+__pycache__   
+*.mitm
+secrets 
+certs
+03-key-findings.md
+
+rev-eng/apk-extractor/hermes-dec-output/**
+!rev-eng/apk-extractor/hermes-dec-output/
+!rev-eng/apk-extractor/hermes-dec-output/.gitkeep
+
+rev-eng/apk-extractor/jadx-java-src/**
+!rev-eng/apk-extractor/jadx-java-src/
+!rev-eng/apk-extractor/jadx-java-src/.gitkeep
+
+rev-eng/apk-extractor/target-apk/**
+!rev-eng/apk-extractor/target-apk/
+!rev-eng/apk-extractor/target-apk/.gitkeep
+
+rev-eng/network-tools/captures/**
+!rev-eng/network-tools/captures/
+!rev-eng/network-tools/captures/.gitkeep
+
+rev-eng/network-tools/certs/**
+!rev-eng/network-tools/certs/
+!rev-eng/network-tools/certs/.gitkeep
+
+
+rev-eng/modules/secrets/**
+!rev-eng/modules/secrets/
+!rev-eng/modules/secrets/.gitkeep
+
 
 
