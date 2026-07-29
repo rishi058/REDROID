@@ -15,13 +15,19 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
    teardown, and JS threat-reaction paths are guarded below. */
 public class Hook implements IXposedHookLoadPackage {
     private static final String TAG = "[TalsecKill] ";
+    private static final String TARGET_PACKAGE = "com.target-appapp";
+    private static final String SPOOF_DEVICE_ID = "accepted-device-id";
+    private static final String DEVICE_ID_PLACEHOLDER_PREFIX = "accepted-device-";
     private static final String PLUGIN = "com.talsecreactnativesecurityplugin.TalsecReactNativeSecurityPluginModule";
     private static final boolean PASSIVE_INTEGRITY_TEST = false;
     private static final boolean BYPASS_RASP_START = false;
-    private static final boolean LOG_NATIVE_THREATS = false;
+    private static final boolean LOG_NATIVE_THREATS = true;
+    private static final boolean LOG_APPICRYPT_INPUTS = true;
+    private static final boolean LOG_INSTALL_SOURCE = true;
+    private static final boolean SPOOF_APPICRYPT_CHECKS = true;
 
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) throws Throwable {
-        if (!"com.target-appapp".equals(lp.packageName)) return;
+        if (!TARGET_PACKAGE.equals(lp.packageName)) return;
         final ClassLoader cl = lp.classLoader;
         XposedBridge.log(TAG + "loaded in " + lp.packageName);
 
@@ -57,6 +63,16 @@ public class Hook implements IXposedHookLoadPackage {
             hookThreatCallback(cl, "Nd.u", "c", "SecureHardwareNotAvailable");
             hookThreatCallback(cl, "Nd.u", "d", "SystemVPN");
             hookThreatCallback(cl, "Nd.u", "e", "Passcode");
+        }
+
+        if (LOG_APPICRYPT_INPUTS) {
+            hookAppiCryptInputs(cl);
+        }
+        if (LOG_INSTALL_SOURCE) {
+            hookInstallSource(cl);
+        }
+        if (!SPOOF_DEVICE_ID.startsWith(DEVICE_ID_PLACEHOLDER_PREFIX)) {
+            hookAppDeviceId(cl);
         }
 
         // 1) Keep native freeRASP/AppiCrypt initialization enabled by default.
@@ -231,5 +247,119 @@ public class Hook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             XposedBridge.log(TAG + "threat telemetry hook " + threatName + " note: " + t);
         }
+    }
+
+    private void hookAppiCryptInputs(final ClassLoader cl) {
+        // JADX aliases this raw default-package class as defpackage.C11663t.
+        // Its c(Long) result is the JSON configuration immediately before it is
+        // obfuscated and supplied to FNatives.z() as dataToSign.
+        try {
+            XposedHelpers.findAndHookMethod("t", cl, "c", Long.class,
+                new XC_MethodHook() {
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        Object value = p.getResult();
+                        XposedBridge.log(TAG + "AppiCrypt config JSON: "
+                            + (value == null ? "null" : value.toString()));
+                        if (SPOOF_APPICRYPT_CHECKS && value != null) {
+                            try {
+                                setCheckStatus(value, "unofficialStore", "OK");
+                                setCheckStatus(value, "privilegedAccess", "OK");
+                                XposedBridge.log(TAG + "AppiCrypt spoofed JSON: " + value.toString());
+                            } catch (Throwable t) {
+                                XposedBridge.log(TAG + "AppiCrypt JSON spoof FAILED: " + t);
+                            }
+                        }
+                    }
+                });
+            XposedBridge.log(TAG + "AppiCrypt pre-signing config probe installed");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "AppiCrypt config probe FAILED: " + t);
+        }
+
+        try {
+            Class<?> contextClass = XposedHelpers.findClass("android.content.Context", cl);
+            XposedHelpers.findAndHookMethod("androidx.security.FNatives", cl, "z",
+                contextClass, byte[].class, String.class, byte[].class,
+                byte[].class, byte[].class, long.class, new XC_MethodHook() {
+                    protected void beforeHookedMethod(MethodHookParam p) {
+                        byte[] publicKey = (byte[]) p.args[1];
+                        byte[] nonce = (byte[]) p.args[3];
+                        byte[] dataToSign = (byte[]) p.args[4];
+                        byte[] apkDerived = (byte[]) p.args[5];
+                        XposedBridge.log(TAG + "FNatives.z inputs: kid=" + p.args[2]
+                            + " publicKeyLen=" + length(publicKey)
+                            + " nonceLen=" + length(nonce)
+                            + " dataToSignLen=" + length(dataToSign)
+                            + " apkDerived=" + toHex(apkDerived)
+                            + " configCrc32=" + p.args[6]);
+                    }
+                });
+            XposedBridge.log(TAG + "FNatives.z metadata probe installed");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "FNatives.z metadata probe FAILED: " + t);
+        }
+    }
+
+    private void hookInstallSource(final ClassLoader cl) {
+        try {
+            Class<?> pm = XposedHelpers.findClass("android.app.ApplicationPackageManager", cl);
+            XposedHelpers.findAndHookMethod(pm, "getInstallerPackageName", String.class,
+                new XC_MethodHook() {
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        if (TARGET_PACKAGE.equals(p.args[0])) {
+                            XposedBridge.log(TAG + "installerPackageName=" + p.getResult());
+                        }
+                    }
+                });
+            XposedHelpers.findAndHookMethod(pm, "getInstallSourceInfo", String.class,
+                new XC_MethodHook() {
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        if (!TARGET_PACKAGE.equals(p.args[0]) || p.getResult() == null) return;
+                        Object info = p.getResult();
+                        XposedBridge.log(TAG + "installSourceInfo: initiating="
+                            + XposedHelpers.callMethod(info, "getInitiatingPackageName")
+                            + " originating="
+                            + XposedHelpers.callMethod(info, "getOriginatingPackageName")
+                            + " installing="
+                            + XposedHelpers.callMethod(info, "getInstallingPackageName"));
+                    }
+                });
+            XposedBridge.log(TAG + "install-source value probe installed");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "install-source probe FAILED: " + t);
+        }
+    }
+
+    private void hookAppDeviceId(final ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                "com.learnium.RNDeviceInfo.RNDeviceModule", cl, "getUniqueIdSync",
+                new XC_MethodHook() {
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        XposedBridge.log(TAG + "RNDeviceInfo unique ID overridden for accepted-session A/B");
+                        p.setResult(SPOOF_DEVICE_ID);
+                    }
+                });
+            XposedBridge.log(TAG + "accepted-session device-ID hook installed");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "device-ID hook FAILED: " + t);
+        }
+    }
+
+    private static int length(byte[] value) {
+        return value == null ? -1 : value.length;
+    }
+
+    private static void setCheckStatus(Object root, String checkName, String status) {
+        Object checks = XposedHelpers.callMethod(root, "getJSONObject", "checks");
+        Object check = XposedHelpers.callMethod(checks, "getJSONObject", checkName);
+        XposedHelpers.callMethod(check, "put", "status", status);
+    }
+
+    private static String toHex(byte[] value) {
+        if (value == null) return "null";
+        StringBuilder out = new StringBuilder(value.length * 2);
+        for (byte b : value) out.append(String.format("%02x", b & 0xff));
+        return out.toString();
     }
 }
