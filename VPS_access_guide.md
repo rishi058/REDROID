@@ -1,5 +1,4 @@
 # VPS ACCESS
-
     key path = C:/Users/YOUR_WINDOWS_USER/.ssh/YOUR_PRIVATE_KEY.key
     env = ubuntu
     instance ip = YOUR_VPS_PUBLIC_IP

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 
+# THE USER CAN NOW MONITOR THE SCRIPTS AND ALLOWS/DENIES AI AGENT : MIDDLEWARE FOR AUTO MODE
+# USE THIS SCRIPT FOR EXECUTING COMMANDS
+
 import subprocess
 import sys
 import shlex

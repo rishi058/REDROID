@@ -62,7 +62,9 @@ mod_build/
 ├─ AndroidManifest.xml                    # declares the LSPosed module
 ├─ assets/xposed_init                     # says which class LSPosed loads
 ├─ build_module.sh                        # no-Gradle build and signing recipe
-├─ scope_talseckill.sh                   # enables/scopes it in LSPosed DB
+├─ scope_talseckill.sh                   # on-device: enable + scope in LSPosed DB
+├─ fix_lspd_scope.sh                      # on-device: scope + repair stale apk_path
+├─ patch_lspd.py                          # host-side: same repair when device sqlite3 is broken
 ├─ xposed-api.jar                         # compile-only API 82 dependency
 ├─ key.pk8                                # private APK signing key -- confidential
 └─ cert.der                               # corresponding public certificate
@@ -108,6 +110,39 @@ runtime guard is important even when LSPosed scope configuration is wrong.
 The scope is deliberately not global. Do not broaden it without a reason: many
 hooks below target Android framework classes and would affect another process
 if this module were loaded there.
+
+### Scoping helpers — which one to use
+
+Three scripts write the same LSPosed `modules_config.db`. Pick by situation:
+
+| Script | Runs on | Enables | Fixes `apk_path` | Use when |
+| --- | --- | --- | --- | --- |
+| `scope_talseckill.sh` | device (root) | yes | no | First scope after a fresh install, path still valid. |
+| `fix_lspd_scope.sh` | device (root) | yes | **yes** | After `adb install -r` — the randomized `/data/app/...` path went stale and the module stopped loading. |
+| `patch_lspd.py` | **host** (off-device) | yes | **yes** | On-device `sqlite3` core-dumps (ABI-broken ReDroid image) or the `adb shell` user has no access to `/data/adb`. |
+
+Why `apk_path` repair exists: LSPosed caches an **absolute** path to the module
+APK, and every `adb install -r` randomizes that path. LSPosed then sees the row
+enabled and scoped but the file missing, and **silently** fails to load the
+module — no hook, no log line. `fix_lspd_scope.sh` / `patch_lspd.py` re-resolve
+the live path (`pm path com.recon.talsecbypass`) and write it back. This is the
+usual reason a freshly-rebuilt module "installs fine" yet never injects.
+
+`patch_lspd.py` operates on a **copy** of the DB pulled off the device, because
+the ReDroid container's `/system/bin/sqlite3` can core-dump and the `adb shell`
+user cannot read `/data/adb`. Typical host workflow:
+
+```bash
+sudo docker cp <ctr>:/data/adb/lspd/config/modules_config.db /tmp/db
+sudo python3 patch_lspd.py /tmp/db com.recon.talsecbypass com.target-appapp "$(adb shell pm path com.recon.talsecbypass | sed 's/package://')"
+sudo docker cp /tmp/db <ctr>:/data/adb/lspd/config/modules_config.db
+# remove the container's stale modules_config.db-wal / -shm, then reboot the host
+```
+
+All three leave the target as the `com.target-appapp` placeholder (substituted at
+deploy time) and all require a **Zygote restart (host reboot)** afterwards — a
+`docker restart` alone does not re-arm the KernelSU trigger, so Zygisk never
+re-injects and LSPosed never reloads.
 
 ## Runtime behaviour: current hooks
 

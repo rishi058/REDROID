@@ -386,7 +386,7 @@ def decompile_java(
     out_dir: str,
     *,
     restart: bool = False,
-    timeout: int = 1200,
+    timeout: int = 900,
     tmp_dir: str | None = None,
 ) -> bool:
     out_path = Path(out_dir)
@@ -417,6 +417,9 @@ def decompile_java(
 
     jadx_path = shutil.which("jadx")
     if jadx_path:
+        # JADX writes directly to its output directory.  Create it before
+        # launching so a timeout leaves the partial tree at --java-dir rather
+        # than losing it with this run's temporary directory.
         out_path.mkdir(parents=True, exist_ok=True)
         console.print("[cyan]Running jadx on Java/Kotlin layer...[/cyan]")
         env = os.environ.copy()
@@ -440,7 +443,8 @@ def decompile_java(
             _write_jadx_marker(complete_marker, "complete", apk_path, r.returncode)
             return True
         if _has_java_output(out_path):
-            _write_jadx_marker(partial_marker, "partial", apk_path, r.returncode)
+            status = "timed-out-partial" if r.returncode == -1 else "partial"
+            _write_jadx_marker(partial_marker, status, apk_path, r.returncode)
             console.print(
                 f"[yellow]JADX output is partial and was preserved in {out_path}. "
                 "It cannot resume from this percentage.[/yellow]"
@@ -476,13 +480,14 @@ Examples:
     )
     parser.add_argument("--apk",          required=True,
                         help="Path to .apk / .apks / .xapk file")
-    parser.add_argument("--keep-bundle",  action="store_true",        help="Save decompiled JS bundle")
+    parser.add_argument("--keep-bundle",  action="store_true",
+                        help="Retain plain Metro JS output too (Hermes output is always retained)")
     parser.add_argument("--bundle-out",   default=str(DEFAULT_HERMES_OUTPUT),
                         help="Retained Hermes/Metro output path (default: apk-extractor/hermes-dec-output/decompiled_bundle.js)")
     parser.add_argument("--no-java",      action="store_true",        help="Skip jadx Java decompile")
     parser.add_argument("--java-dir",     help="Directory to cache/reuse decompiled Java code")
-    parser.add_argument("--java-timeout", type=int, default=1200,
-                        help="JADX/apktool timeout in seconds (default: 1200)")
+    parser.add_argument("--java-timeout", type=int, default=900,
+                        help="JADX/apktool timeout in seconds (default: 900)")
     parser.add_argument("--restart-java", action="store_true",
                         help="Delete partial Java output and rerun JADX from zero (JADX cannot resume)")
     parser.add_argument("--tmp-dir",      default=str(DEFAULT_TMP_DIR),
@@ -535,18 +540,17 @@ Examples:
 
             if is_hermes:
                 console.print(f"[yellow]Hermes bytecode detected (version {hv})[/yellow]")
-                if args.keep_bundle:
-                    dec_path = str(Path(args.bundle_out).resolve())
-                    Path(dec_path).parent.mkdir(parents=True, exist_ok=True)
-                    Path(dec_path).unlink(missing_ok=True)
-                else:
-                    dec_path = os.path.join(tmp, "bundle_decompiled.js")
+                # Decompiled Hermes output is useful even after a failed or
+                # timed-out Java pass, so never place it in the per-run temp
+                # directory that is removed on exit.
+                dec_path = str(Path(args.bundle_out).resolve())
+                Path(dec_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(dec_path).unlink(missing_ok=True)
                 obf.decompiled_ok = decompile_hermes(bundle_path, dec_path)
 
                 if obf.decompiled_ok:
                     js_text = Path(dec_path).read_text(errors="ignore")
-                    if args.keep_bundle:
-                        console.print(f"[dim]Decompiled JS saved directly → {dec_path}[/dim]")
+                    console.print(f"[dim]Decompiled JS saved directly → {dec_path}[/dim]")
                 else:
                     console.print("[yellow]Extracting strings from Hermes binary...[/yellow]")
                     js_text = extract_strings_from_binary(bundle_path)
@@ -572,10 +576,13 @@ Examples:
         # Step 3 — optional Java layer
         if not args.no_java:
             if args.java_dir:
-                java_dir = args.java_dir
+                java_dir = str(Path(args.java_dir).resolve())
                 os.makedirs(java_dir, exist_ok=True)
             else:
-                java_dir = os.path.join(tmp, "java")
+                # A temporary Java directory disappears after a timeout. Use
+                # the durable default output location unless explicitly told
+                # otherwise, so partial JADX output is always retained.
+                java_dir = str((SCRIPT_DIR / "jadx-java-src").resolve())
                 
             if decompile_java(
                 str(apk_path),
@@ -601,7 +608,7 @@ Examples:
     if bundle_path:
         for line in obf.summary_lines():
             console.print(f"  {line}")
-    if args.keep_bundle:
+    if args.keep_bundle or (bundle_path and obf.is_hermes):
         console.print(f"  Retained bundle   : {Path(args.bundle_out).resolve()}")
     if not args.no_java:
         console.print(f"  Java output       : {Path(java_dir).resolve()}")

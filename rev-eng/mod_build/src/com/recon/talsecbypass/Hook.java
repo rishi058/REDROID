@@ -6,6 +6,8 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
+import java.util.Set;
 
 /* Targeted freeRASP/Talsec reaction guard for com.target-appapp.
    The app obfuscated the freeRASP SDK, so generic unrasp couldn't hook it. The
@@ -20,22 +22,55 @@ public class Hook implements IXposedHookLoadPackage {
     private static final String SPOOF_DEVICE_ID = "accepted-device-id";
     private static final String DEVICE_ID_PLACEHOLDER_PREFIX = "accepted-device-";
     private static final String PLUGIN = "com.talsecreactnativesecurityplugin.TalsecReactNativeSecurityPluginModule";
-    private static final boolean PASSIVE_INTEGRITY_TEST = false;
-    private static final boolean BYPASS_RASP_START = false;
-    private static final boolean LOG_NATIVE_THREATS = true;
-    private static final boolean LOG_APPICRYPT_INPUTS = true;
-    private static final boolean LOG_INSTALL_SOURCE = true;
-    private static final boolean SPOOF_APPICRYPT_CHECKS = true;
-    private static boolean loggedAppiCryptCheckSchema = false;
 
+    // ── core behaviour toggles ───────────────────────────────────────────────
+    private static final boolean PASSIVE_INTEGRITY_TEST  = false;
+    private static final boolean BYPASS_RASP_START       = false;
+
+    // ── existing logging / spoofing ──────────────────────────────────────────
+    private static final boolean LOG_NATIVE_THREATS      = true;
+    private static final boolean LOG_APPICRYPT_INPUTS    = true;
+    private static final boolean LOG_INSTALL_SOURCE      = true;
+    private static final boolean SPOOF_APPICRYPT_CHECKS  = true;
+
+    // ── NEW: blanket mutation ────────────────────────────────────────────────
+    // Iterate ALL checks in the AppiCrypt JSON and set every NOK entry to OK,
+    // not just the two that were previously hard-coded.  This is a superset of
+    // the prior behaviour and is safe to leave enabled.
+    private static final boolean SPOOF_ALL_NOK_CHECKS    = true;
+
+    // ── NEW: extended diagnostics ────────────────────────────────────────────
+    // Log the complete checks sub-tree (all key→status pairs) before mutation.
+    private static final boolean LOG_FULL_CHECKS_JSON    = true;
+    // Log the four device-identifier values returned by getIdentifiers().
+    // Only presence/length is emitted — no actual identifier bytes.
+    private static final boolean LOG_IDENTIFIERS         = true;
+    // Desync the RASP-execution-state channel in addition to the threat channel.
+    private static final boolean DESYNC_RASP_STATE_CHANNEL = true;
+    // Log the nonce length and cloud-project number for every Play Integrity
+    // requestToken call (no nonce value, no token).
+    private static final boolean LOG_PLAY_INTEGRITY      = true;
+    // Log getCryptogram() entry / outcome (no cryptogram value).
+    private static final boolean LOG_CRYPTOGRAM_RESULT   = true;
+    // Log FNatives.y (the second native protected operation) call/return size.
+    private static final boolean LOG_FNATIVES_Y          = true;
+    // Log FNatives.z return-value size and the set of threats that fired before
+    // it was invoked (key diagnostic: which RASP signals are in the cryptogram).
+    private static final boolean LOG_FNATIVES_Z_RETURN   = true;
+
+    // ── mutable state ────────────────────────────────────────────────────────
+    private static boolean loggedAppiCryptCheckSchema = false;
+    // Accumulates every native threat name that fires after process start.
+    // Emitted alongside the FNatives.z return so we can correlate what the
+    // native signer "saw" with whether the server accepted the cryptogram.
+    private static final Set<String> firedThreats = new LinkedHashSet<>();
+
+    // ────────────────────────────────────────────────────────────────────────
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) throws Throwable {
         if (!TARGET_PACKAGE.equals(lp.packageName)) return;
         final ClassLoader cl = lp.classLoader;
         XposedBridge.log(TAG + "loaded in " + lp.packageName);
 
-        // A/B mode: leave the target completely untouched so AppiCrypt can mint
-        // a cryptogram without any Talsec method or Android framework hook.
-        // target-app may later enforce its normal self-termination behavior.
         if (PASSIVE_INTEGRITY_TEST) {
             XposedBridge.log(TAG + "passive integrity test: zero hooks installed");
             return;
@@ -75,6 +110,18 @@ public class Hook implements IXposedHookLoadPackage {
         }
         if (!SPOOF_DEVICE_ID.startsWith(DEVICE_ID_PLACEHOLDER_PREFIX)) {
             hookAppDeviceId(cl);
+        }
+        if (LOG_IDENTIFIERS) {
+            hookGetIdentifiers(cl);
+        }
+        if (DESYNC_RASP_STATE_CHANNEL) {
+            hookRaspExecutionState(cl);
+        }
+        if (LOG_PLAY_INTEGRITY) {
+            hookPlayIntegrityRequest(cl);
+        }
+        if (LOG_CRYPTOGRAM_RESULT) {
+            hookCryptogramResult(cl);
         }
 
         // 1) Keep native freeRASP/AppiCrypt initialization enabled by default.
@@ -176,6 +223,7 @@ public class Hook implements IXposedHookLoadPackage {
                 protected void beforeHookedMethod(MethodHookParam p) { p.setResult(false); XposedBridge.log(TAG + "moveTaskToBack blocked"); }
             });
         } catch (Throwable t) {}
+
         // 6) STABILITY: desync the JS threat channel so the reaction never reaches JS.
         //    Talsec delivers threats over a NativeEventEmitter channel whose names are
         //    per-session SecureRandom ints (Nd.AbstractC3346p.f15645b/c/d). JS calls
@@ -203,6 +251,7 @@ public class Hook implements IXposedHookLoadPackage {
         XposedBridge.log(TAG + "reaction guards installed (native RASP active, threat channel desynced)");
     }
 
+    // ── process-kill guard ───────────────────────────────────────────────────
     private void hookSelfSigkill(final ClassLoader cl, final String method,
                                  final boolean explicitSignal) {
         try {
@@ -238,11 +287,15 @@ public class Hook implements IXposedHookLoadPackage {
         }
     }
 
+    // ── native threat telemetry ──────────────────────────────────────────────
+    // Tracks which native threat callbacks have fired; emitted alongside the
+    // FNatives.z return so we can see which RASP signals arrived before signing.
     private void hookThreatCallback(final ClassLoader cl, final String className,
                                     final String method, final String threatName) {
         try {
             XposedHelpers.findAndHookMethod(className, cl, method, new XC_MethodHook() {
                 protected void beforeHookedMethod(MethodHookParam p) {
+                    firedThreats.add(threatName);
                     XposedBridge.log(TAG + "native threat detected: " + threatName);
                 }
             });
@@ -251,6 +304,7 @@ public class Hook implements IXposedHookLoadPackage {
         }
     }
 
+    // ── AppiCrypt / FNatives hooks ───────────────────────────────────────────
     private void hookAppiCryptInputs(final ClassLoader cl) {
         // Do not depend on the obfuscated config-builder class name: it changed
         // in v24. The signed configuration remains an org.json.JSONObject, so
@@ -262,6 +316,14 @@ public class Hook implements IXposedHookLoadPackage {
                     protected void beforeHookedMethod(MethodHookParam p) {
                         if (SPOOF_APPICRYPT_CHECKS) {
                             try {
+                                if (LOG_FULL_CHECKS_JSON) {
+                                    // Log the entire checks sub-tree once per session so we
+                                    // have a record of every key/status pair in the schema.
+                                    String full = fullChecksJson(p.thisObject);
+                                    if (full != null && !loggedAppiCryptCheckSchema) {
+                                        XposedBridge.log(TAG + "AppiCrypt full checks JSON (pre-mutation): " + full);
+                                    }
+                                }
                                 String checkSummary = summarizeCheckStatuses(p.thisObject);
                                 if (spoofAppiCryptCheckStatuses(p.thisObject)) {
                                     if (!loggedAppiCryptCheckSchema) {
@@ -305,6 +367,8 @@ public class Hook implements IXposedHookLoadPackage {
 
         // Diskwala v24 changed z() to Context + six byte arrays + two flags.
         // Keep this observational: the native signer is still called normally.
+        // afterHookedMethod now emits the return-value size and the threats that
+        // fired before this call — key data for diagnosing the cryptogram content.
         try {
             Class<?> contextClass = XposedHelpers.findClass("android.content.Context", cl);
             XposedHelpers.findAndHookMethod("androidx.security.FNatives", cl, "z",
@@ -317,15 +381,57 @@ public class Hook implements IXposedHookLoadPackage {
                         XposedBridge.log(TAG + "FNatives.z v24 interface:"
                             + " nonceLen=" + length(nonce)
                             + " dataToSignLen=" + length(dataToSign)
-                            + " dataShape=" + appiCryptDataShape(dataToSign));
+                            + " dataShape=" + appiCryptDataShape(dataToSign)
+                            + " threatsBeforeSigning=[" + joinThreats() + "]");
+                    }
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        if (!LOG_FNATIVES_Z_RETURN) return;
+                        Object result = p.getResult();
+                        String info;
+                        if (result == null) {
+                            info = "null";
+                        } else if (result instanceof String) {
+                            info = "len=" + ((String) result).length();
+                        } else {
+                            info = result.getClass().getSimpleName();
+                        }
+                        XposedBridge.log(TAG + "FNatives.z v24 returned: " + info
+                            + " threatsAtReturn=[" + joinThreats() + "]");
                     }
                 });
             XposedBridge.log(TAG + "FNatives.z v24 metadata probe installed");
         } catch (Throwable t) {
             XposedBridge.log(TAG + "FNatives.z v24 probe FAILED: " + t);
         }
+
+        // FNatives.y is the second native protected operation in libts.so.
+        // It may be called during SDK initialisation or key-derivation. Logging
+        // call/return lets us see when it's invoked relative to the v3 request.
+        if (LOG_FNATIVES_Y) {
+            try {
+                XposedHelpers.findAndHookMethod("androidx.security.FNatives", cl, "y",
+                    byte[].class, byte[].class, byte[].class, byte[].class,
+                    byte.class, byte.class, new XC_MethodHook() {
+                        protected void beforeHookedMethod(MethodHookParam p) {
+                            XposedBridge.log(TAG + "FNatives.y called:"
+                                + " arg0len=" + length((byte[]) p.args[0])
+                                + " arg1len=" + length((byte[]) p.args[1]));
+                        }
+                        protected void afterHookedMethod(MethodHookParam p) {
+                            Object r = p.getResult();
+                            String info = (r instanceof byte[])
+                                ? "len=" + ((byte[]) r).length : (r == null ? "null" : r.getClass().getSimpleName());
+                            XposedBridge.log(TAG + "FNatives.y returned: " + info);
+                        }
+                    });
+                XposedBridge.log(TAG + "FNatives.y probe installed");
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + "FNatives.y probe note: " + t);
+            }
+        }
     }
 
+    // ── install-source telemetry ─────────────────────────────────────────────
     private void hookInstallSource(final ClassLoader cl) {
         try {
             Class<?> pm = XposedHelpers.findClass("android.app.ApplicationPackageManager", cl);
@@ -356,6 +462,7 @@ public class Hook implements IXposedHookLoadPackage {
         }
     }
 
+    // ── device-ID override (accepted-session A/B) ────────────────────────────
     private void hookAppDeviceId(final ClassLoader cl) {
         try {
             XposedHelpers.findAndHookMethod(
@@ -372,33 +479,207 @@ public class Hook implements IXposedHookLoadPackage {
         }
     }
 
+    // ── NEW: identifier telemetry ────────────────────────────────────────────
+    // Hook WritableNativeMap.putString() and log the four identifier values that
+    // getIdentifiers() writes into the result map. Only the key name and whether
+    // the value is empty/present (+ length) are emitted — no raw identifier bytes.
+    //
+    // Diagnostic target: we need to confirm whether mediaDrm is always empty in
+    // this Redroid build (expected) and see the fingerprintV3 / androidId lengths.
+    // An empty mediaDrm is a server-visible Redroid fingerprint embedded in tCfg.
+    private void hookGetIdentifiers(final ClassLoader cl) {
+        try {
+            Class<?> mapClass = XposedHelpers.findClass(
+                "com.facebook.react.bridge.WritableNativeMap", cl);
+            XposedHelpers.findAndHookMethod(mapClass, "putString",
+                String.class, String.class, new XC_MethodHook() {
+                    protected void beforeHookedMethod(MethodHookParam p) {
+                        String key = (String) p.args[0];
+                        if (!"sessionId".equals(key) && !"androidId".equals(key)
+                                && !"mediaDrm".equals(key) && !"fingerprintV3".equals(key)) {
+                            return;
+                        }
+                        String value = (String) p.args[1];
+                        boolean empty = (value == null || value.isEmpty());
+                        XposedBridge.log(TAG + "identifier put: " + key + "="
+                            + (empty ? "EMPTY" : "present[" + value.length() + "chars]"));
+                    }
+                });
+            XposedBridge.log(TAG + "identifier logging hook installed");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "identifier hook note: " + t);
+        }
+    }
+
+    // ── NEW: RASP execution-state channel desync ─────────────────────────────
+    // The threat channel (getThreatChannelData) was already desynced. The RASP
+    // execution-state channel (getRaspExecutionStateChannelData) is a separate
+    // NativeEventEmitter channel that delivers SDK execution-lifecycle events.
+    // Desync it with the same dead-channel technique so no RASP execution state
+    // can reach JS and trigger a secondary client-side reaction.
+    private void hookRaspExecutionState(final ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod(PLUGIN, cl, "getRaspExecutionStateChannelData",
+                "com.facebook.react.bridge.Promise", new XC_MethodHook() {
+                    protected void beforeHookedMethod(MethodHookParam p) {
+                        try {
+                            Class<?> argsClass = XposedHelpers.findClass(
+                                "com.facebook.react.bridge.Arguments", cl);
+                            Object arr = XposedHelpers.callStaticMethod(argsClass, "createArray");
+                            XposedHelpers.callMethod(arr, "pushString", "dead_rasp_ch_a");
+                            XposedHelpers.callMethod(arr, "pushString", "dead_rasp_ch_b");
+                            XposedHelpers.callMethod(p.args[0], "resolve", arr);
+                            p.setResult(null);
+                            XposedBridge.log(TAG + "getRaspExecutionStateChannelData -> DESYNCED");
+                        } catch (Throwable t) {
+                            XposedBridge.log(TAG + "RASP state desync err: " + t);
+                        }
+                    }
+                });
+            XposedBridge.log(TAG + "getRaspExecutionStateChannelData desync installed");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "getRaspExecutionStateChannelData hook FAILED: " + t);
+        }
+    }
+
+    // ── NEW: Play Integrity request telemetry ────────────────────────────────
+    // Logs the nonce length and cloud-project number for every requestToken call
+    // so we can verify the nonce binding and confirm the project number matches
+    // the one hardcoded in the bundle (219619808378). Never logs the nonce value,
+    // the resulting token, or any other sensitive material.
+    private void hookPlayIntegrityRequest(final ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                TARGET_PACKAGE + ".integrity.PlayIntegrityModule", cl, "requestToken",
+                String.class, String.class,
+                "com.facebook.react.bridge.Promise", new XC_MethodHook() {
+                    protected void beforeHookedMethod(MethodHookParam p) {
+                        String nonce = (String) p.args[0];
+                        String cloudProject = (String) p.args[1];
+                        XposedBridge.log(TAG + "PlayIntegrity.requestToken: nonceLen="
+                            + (nonce == null ? "null" : nonce.length())
+                            + " cloudProject=" + cloudProject);
+                    }
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        if (p.getThrowable() != null) {
+                            XposedBridge.log(TAG + "PlayIntegrity.requestToken threw: " + p.getThrowable());
+                        } else {
+                            XposedBridge.log(TAG + "PlayIntegrity.requestToken: request submitted to GMS");
+                        }
+                    }
+                });
+            XposedBridge.log(TAG + "PlayIntegrity request logging hook installed");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "PlayIntegrity hook note: " + t);
+        }
+    }
+
+    // ── NEW: getCryptogram outcome telemetry ─────────────────────────────────
+    // Logs whether getCryptogram() completes normally or throws/rejects so we can
+    // distinguish a cryptogram-generation failure from a server-side rejection.
+    // Does NOT log the cryptogram value or the nonce.
+    private void hookCryptogramResult(final ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod(PLUGIN, cl, "getCryptogram",
+                String.class, "com.facebook.react.bridge.Promise", new XC_MethodHook() {
+                    protected void beforeHookedMethod(MethodHookParam p) {
+                        String nonce = (String) p.args[0];
+                        XposedBridge.log(TAG + "getCryptogram: entry nonceLen="
+                            + (nonce == null ? "null" : nonce.length()));
+                    }
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        if (p.getThrowable() != null) {
+                            XposedBridge.log(TAG + "getCryptogram: method threw " + p.getThrowable());
+                        } else {
+                            XposedBridge.log(TAG + "getCryptogram: method completed normally");
+                        }
+                    }
+                });
+            XposedBridge.log(TAG + "getCryptogram logging hook installed");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "getCryptogram hook note: " + t);
+        }
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────────
     private static int length(byte[] value) {
         return value == null ? -1 : value.length;
     }
 
-    private static void setCheckStatus(Object root, String checkName, String status) {
-        Object checks = XposedHelpers.callMethod(root, "getJSONObject", "checks");
-        Object check = XposedHelpers.callMethod(checks, "getJSONObject", checkName);
-        XposedHelpers.callMethod(check, "put", "status", status);
+    private static String joinThreats() {
+        if (firedThreats.isEmpty()) return "none";
+        StringBuilder sb = new StringBuilder();
+        for (String t : firedThreats) {
+            if (sb.length() > 0) sb.append(',');
+            sb.append(t);
+        }
+        return sb.toString();
     }
 
+    // Mutate the AppiCrypt checks JSON before the native signer serialises it.
+    //
+    // SPOOF_ALL_NOK_CHECKS=true (default): iterate every key in the checks object
+    // and force any NOK status to OK. This is a strict superset of the original
+    // two-key behaviour and ensures we cover any check type that is or becomes NOK
+    // in the Redroid environment without needing to name it explicitly.
+    //
+    // Returns true only when the JSONObject is a Talsec checks schema (has a
+    // "checks" sub-object) so callers know whether this is the right object.
     private static boolean spoofAppiCryptCheckStatuses(Object root) {
         Object checks = XposedHelpers.callMethod(root, "optJSONObject", "checks");
         if (checks == null) return false;
-        Object unofficialStore = XposedHelpers.callMethod(checks, "optJSONObject", "unofficialStore");
-        Object privilegedAccess = XposedHelpers.callMethod(checks, "optJSONObject", "privilegedAccess");
-        if (unofficialStore == null || privilegedAccess == null) return false;
 
-        boolean changed = false;
-        if ("NOK".equals(XposedHelpers.callMethod(unofficialStore, "optString", "status", ""))) {
-            XposedHelpers.callMethod(unofficialStore, "put", "status", "OK");
-            changed = true;
+        if (!SPOOF_ALL_NOK_CHECKS) {
+            // Original selective mutation kept as a fallback path.
+            Object unofficialStore = XposedHelpers.callMethod(checks, "optJSONObject", "unofficialStore");
+            Object privilegedAccess = XposedHelpers.callMethod(checks, "optJSONObject", "privilegedAccess");
+            if (unofficialStore == null || privilegedAccess == null) return false;
+            boolean changed = false;
+            if ("NOK".equals(XposedHelpers.callMethod(unofficialStore, "optString", "status", ""))) {
+                XposedHelpers.callMethod(unofficialStore, "put", "status", "OK");
+                changed = true;
+            }
+            if ("NOK".equals(XposedHelpers.callMethod(privilegedAccess, "optString", "status", ""))) {
+                XposedHelpers.callMethod(privilegedAccess, "put", "status", "OK");
+                changed = true;
+            }
+            return changed;
         }
-        if ("NOK".equals(XposedHelpers.callMethod(privilegedAccess, "optString", "status", ""))) {
-            XposedHelpers.callMethod(privilegedAccess, "put", "status", "OK");
-            changed = true;
+
+        // Blanket mode: walk every check key and force NOK -> OK.
+        boolean changed = false;
+        try {
+            Object iteratorObject = XposedHelpers.callMethod(checks, "keys");
+            if (!(iteratorObject instanceof Iterator)) return false;
+            Iterator<?> iterator = (Iterator<?>) iteratorObject;
+            while (iterator.hasNext()) {
+                String name = String.valueOf(iterator.next());
+                Object check = XposedHelpers.callMethod(checks, "optJSONObject", name);
+                if (check == null) continue;
+                String status = String.valueOf(
+                    XposedHelpers.callMethod(check, "optString", "status", ""));
+                if ("NOK".equals(status)) {
+                    XposedHelpers.callMethod(check, "put", "status", "OK");
+                    XposedBridge.log(TAG + "AppiCrypt blanket-mutated: " + name + " NOK -> OK");
+                    changed = true;
+                }
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "blanket mutation iterate failed: " + t);
         }
         return changed;
+    }
+
+    // Returns the full serialised checks sub-object as a string, used for the
+    // one-time full-JSON diagnostic log. Never called unless LOG_FULL_CHECKS_JSON.
+    private static String fullChecksJson(Object root) {
+        try {
+            Object checks = XposedHelpers.callMethod(root, "optJSONObject", "checks");
+            if (checks == null) return null;
+            return String.valueOf(XposedHelpers.callMethod(checks, "toString"));
+        } catch (Throwable t) {
+            return "error:" + t.getMessage();
+        }
     }
 
     // Diagnostic output is deliberately limited to check names and their
