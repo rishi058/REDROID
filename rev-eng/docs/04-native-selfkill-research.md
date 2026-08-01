@@ -7,7 +7,7 @@ ART's generic JNI trampoline. The exact path is an eight-second delayed call to 
 
 The working fix hooks that one native Java method with LSPosed before JNI executes. target-app then
 kept the same foreground PID for at least 70 seconds with no kernel-observed `SIGKILL` targeting
-it. See `../../exp-journey.md §8` for commands and proof. The native instrumentation material below
+it. See [`../../rev-eng-journey.md`](../../rev-eng-journey.md) §8 for commands and proof. The native instrumentation material below
 is retained as historical prior art, not as the recommended implementation.
 
 > Research method note: general search engines were bot‑blocked in the research environment;
@@ -199,3 +199,196 @@ No Frida server, seccomp filter, native memory patch, or tracer remains active a
   The doc has the full link index, arm64 syscall numbers, a copy-paste Frida starter, the module-scoping approach, and a 5-step diagnose→neutralize→scope→escalate plan — everything you need to implement later without re-researching.
 
 > Net: it's achievable but a genuine cat-and-mouse effort
+
+---
+
+## 8. Follow-up — the practical bypass was achieved
+
+The sentence above records the uncertainty at the end of the research phase. It
+is no longer the final project verdict. The remaining native self-kill was later
+attributed to one exact Java-to-JNI boundary and neutralised reliably without a
+general native anti-anti-Frida framework.
+
+The complete chronological evidence is in
+[`../../rev-eng-journey.md`](../../rev-eng-journey.md), especially §8. This
+section preserves the successful path so the document reads as a journey from
+generic prior art to a proven target-specific fix.
+
+### 8.1 What the earlier experiments established
+
+Before the exact sender was known, the project had already removed the visible
+Java/React Native reactions:
+
+- PairIPFix allowed Target-App to reach its real activity;
+- the custom LSPosed module desynchronised Talsec's threat channel;
+- Java `System.exit`, process-kill wrappers, activity teardown, and task
+  backgrounding were guarded; and
+- Target-App remained foreground longer than before but still died with signal
+  9 after the delayed native reaction.
+
+Android's exit history reported a foreground `SIGKILL`, but did not identify the
+sender. A temporary Frida libc probe did not log the final call because the
+process could die before its last diagnostic message was delivered. The broad
+seccomp experiment was also rejected: denying `exit`/`exit_group` broke normal
+process semantics and produced a startup `SIGILL`/ANR.
+
+Those failures narrowed the problem but did not prove that the kill was an
+unhookable inline syscall.
+
+### 8.2 Attribute the sender from the shared host kernel
+
+Redroid shares the VPS kernel. A bounded host-side
+`signal:signal_generate` tracepoint captured both sender and target while
+Target-App was launched:
+
+```text
+sender=<TARGET_PACKAGE> pid=<PID> tid=<PID> uid=<APP_UID>
+target=<TARGET_PACKAGE> target_pid=<PID> code=0 group=1 result=0
+```
+
+The sender and target were the same process. This ruled out:
+
+- ActivityManager;
+- `lmkd`/OOM;
+- the Redroid watchdog;
+- an external anti-tamper helper; and
+- a remote process issuing the signal.
+
+The captured user stack resolved to:
+
+```text
+libc.so: kill
+libart.so: art_quick_generic_jni_trampoline
+```
+
+That stack was the decisive clue. The final signal did use native libc
+`kill()`, but execution entered through an ART native-method trampoline. The
+call could therefore be stopped before JNI rather than patched inside libc or
+`libts.so`.
+
+### 8.3 Resolve the exact delayed path
+
+The decompiled Java and matching ARM64 native library established this sequence:
+
+```text
+obfuscated scheduler
+  -> main-looper Handler delay (~8000 ms)
+    -> androidx.security.FNatives.x(int)
+      -> getpid()
+      -> kill(pid, SIGKILL)
+```
+
+Static analysis of `Java_androidx_security_FNatives_x` confirmed that it obtains
+the current PID, loads signal 9, and invokes `kill`.
+
+The neighbouring native methods were distinct:
+
+- `FNatives.x(int)` — delayed self-kill;
+- `FNatives.y(...)` — protected native operation; and
+- `FNatives.z(...)` — AppiCrypt/integrity signing path.
+
+Only `x(int)` could be disabled. Replacing the complete native class or blocking
+all calls into `libts.so` would also break the genuine cryptographic flow needed
+by Target-App.
+
+### 8.4 Add the narrow LSPosed boundary hook
+
+The final implementation in
+`rev-eng/mod_build/src/com/recon/talsecbypass/Hook.java` hooks the declared
+native Java method and returns before ART enters JNI:
+
+```java
+XposedHelpers.findAndHookMethod(
+    "androidx.security.FNatives",
+    classLoader,
+    "x",
+    int.class,
+    new XC_MethodHook() {
+        @Override
+        protected void beforeHookedMethod(MethodHookParam param) {
+            param.setResult(null);
+        }
+    }
+);
+```
+
+The implementation also retained narrow framework guards for self-targeted
+`SIGKILL` paths while forwarding other signals and other target PIDs. It did not
+replace `FNatives.y()` or `FNatives.z()`.
+
+Build and reinstall the separate LSPosed module; Target-App itself remains
+unmodified and Play-signed:
+
+```powershell
+& "C:\Program Files\Git\bin\bash.exe" rev-eng/mod_build/build_module.sh
+adb -s 127.0.0.1:5555 install -r "rev-eng\modules\talseckill.apk"
+```
+
+The module must remain enabled and scoped only to `<TARGET_PACKAGE>` user 0.
+After an APK reinstall, compare the current `pm path` with LSPosed's stored
+`modules.apk_path`; Android may assign a new randomized APK path.
+
+### 8.5 Apply it with a full KernelSU host reboot
+
+An Android-only or Docker-only restart did not reliably replay KernelSU's boot
+stages. In failed restart attempts, Zygisk was absent from Zygote maps and
+LSPosed never injected the module.
+
+Apply the update with a complete VPS reboot:
+
+```powershell
+ssh -i "<SSH_KEY>" -o StrictHostKeyChecking=no `
+  ubuntu@<VPS_HOST> "sudo reboot"
+```
+
+After the host returns, recreate the ADB tunnel, wait for
+`sys.boot_completed=1`, and verify:
+
+```text
+Zygisk mappings present in Zygote
+lspd daemon running
+LSPosed module enabled
+scope contains <TARGET_PACKAGE>, user 0
+Loading class com.recon.talsecbypass.Hook
+```
+
+### 8.6 Sustained runtime proof
+
+After the full reboot, Target-App was launched normally while the host traced
+all generated `SIGKILL` events.
+
+The same foreground PID remained alive and focused at:
+
+```text
+10, 20, 30, 40, 50, 60, and 70 seconds
+```
+
+Safe LSPosed evidence showed:
+
+```text
+[TalsecKill] FNatives.x native self-kill guard installed
+[TalsecKill] FNatives.x native self-kill blocked
+```
+
+The host trace recorded no signal 9 targeting Target-App after the guard was
+installed. A final scan found no fatal exception, ANR, process-death message, or
+signal-9 exit, and the original PID remained the focused application.
+
+No Frida agent, seccomp filter, native memory patch, or host tracer remained
+attached after validation.
+
+### 8.7 Updated verdict
+
+The generic anti-tamper landscape is still a cat-and-mouse problem, but this
+specific hardened build is **resolved reproducibly**:
+
+1. suppress the Java/React Native threat-delivery and teardown reactions;
+2. identify the actual signal sender at the shared host kernel;
+3. resolve the exact ART-to-JNI method responsible for the native self-kill;
+4. hook only `FNatives.x(int)` before JNI;
+5. preserve `FNatives.y()` and `FNatives.z()`; and
+6. apply the scoped module through a complete KernelSU host reboot.
+
+The final result is a stable Target-App process beyond the former
+eight-to-twenty-second kill window, achieved without repackaging the target APK
+or deploying a permanent native injector.
