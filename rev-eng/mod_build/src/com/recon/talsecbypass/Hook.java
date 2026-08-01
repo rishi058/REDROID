@@ -5,6 +5,7 @@ import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
+import java.util.Iterator;
 
 /* Targeted freeRASP/Talsec reaction guard for com.target-appapp.
    The app obfuscated the freeRASP SDK, so generic unrasp couldn't hook it. The
@@ -25,6 +26,7 @@ public class Hook implements IXposedHookLoadPackage {
     private static final boolean LOG_APPICRYPT_INPUTS = true;
     private static final boolean LOG_INSTALL_SOURCE = true;
     private static final boolean SPOOF_APPICRYPT_CHECKS = true;
+    private static boolean loggedAppiCryptCheckSchema = false;
 
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) throws Throwable {
         if (!TARGET_PACKAGE.equals(lp.packageName)) return;
@@ -250,53 +252,77 @@ public class Hook implements IXposedHookLoadPackage {
     }
 
     private void hookAppiCryptInputs(final ClassLoader cl) {
-        // JADX aliases this raw default-package class as defpackage.C11663t.
-        // Its c(Long) result is the JSON configuration immediately before it is
-        // obfuscated and supplied to FNatives.z() as dataToSign.
+        // Do not depend on the obfuscated config-builder class name: it changed
+        // in v24. The signed configuration remains an org.json.JSONObject, so
+        // mutate only the documented checks schema immediately before it is
+        // serialized for the native signer. This does not replace FNatives.z().
         try {
-            XposedHelpers.findAndHookMethod("t", cl, "c", Long.class,
+            XposedHelpers.findAndHookMethod("org.json.JSONObject", cl, "toString",
                 new XC_MethodHook() {
-                    protected void afterHookedMethod(MethodHookParam p) {
-                        Object value = p.getResult();
-                        XposedBridge.log(TAG + "AppiCrypt config JSON: "
-                            + (value == null ? "null" : value.toString()));
-                        if (SPOOF_APPICRYPT_CHECKS && value != null) {
+                    protected void beforeHookedMethod(MethodHookParam p) {
+                        if (SPOOF_APPICRYPT_CHECKS) {
                             try {
-                                setCheckStatus(value, "unofficialStore", "OK");
-                                setCheckStatus(value, "privilegedAccess", "OK");
-                                XposedBridge.log(TAG + "AppiCrypt spoofed JSON: " + value.toString());
+                                String checkSummary = summarizeCheckStatuses(p.thisObject);
+                                if (spoofAppiCryptCheckStatuses(p.thisObject)) {
+                                    if (!loggedAppiCryptCheckSchema) {
+                                        loggedAppiCryptCheckSchema = true;
+                                        XposedBridge.log(TAG + "AppiCrypt check states before mutation: "
+                                            + checkSummary);
+                                    }
+                                    XposedBridge.log(TAG
+                                        + "AppiCrypt checks schema matched; "
+                                        + "unofficialStore/privilegedAccess set to OK before signing");
+                                }
                             } catch (Throwable t) {
-                                XposedBridge.log(TAG + "AppiCrypt JSON spoof FAILED: " + t);
+                                XposedBridge.log(TAG + "AppiCrypt schema mutation FAILED: " + t);
                             }
                         }
                     }
                 });
-            XposedBridge.log(TAG + "AppiCrypt pre-signing config probe installed");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "AppiCrypt config probe FAILED: " + t);
-        }
+            XposedBridge.log(TAG + "AppiCrypt pre-signing JSON schema hook installed");
+        } catch (Throwable t) { XposedBridge.log(TAG + "AppiCrypt JSON schema hook FAILED: " + t); }
 
+        // Pre-v24 interface retained only as a diagnostic. It has a String kid,
+        // five byte arrays, and a long config CRC.
         try {
             Class<?> contextClass = XposedHelpers.findClass("android.content.Context", cl);
             XposedHelpers.findAndHookMethod("androidx.security.FNatives", cl, "z",
                 contextClass, byte[].class, String.class, byte[].class,
                 byte[].class, byte[].class, long.class, new XC_MethodHook() {
                     protected void beforeHookedMethod(MethodHookParam p) {
-                        byte[] publicKey = (byte[]) p.args[1];
                         byte[] nonce = (byte[]) p.args[3];
                         byte[] dataToSign = (byte[]) p.args[4];
-                        byte[] apkDerived = (byte[]) p.args[5];
-                        XposedBridge.log(TAG + "FNatives.z inputs: kid=" + p.args[2]
-                            + " publicKeyLen=" + length(publicKey)
+                        XposedBridge.log(TAG + "FNatives.z legacy interface:"
                             + " nonceLen=" + length(nonce)
                             + " dataToSignLen=" + length(dataToSign)
-                            + " apkDerived=" + toHex(apkDerived)
-                            + " configCrc32=" + p.args[6]);
+                            + " dataShape=" + appiCryptDataShape(dataToSign));
                     }
                 });
-            XposedBridge.log(TAG + "FNatives.z metadata probe installed");
+            XposedBridge.log(TAG + "FNatives.z legacy metadata probe installed");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "FNatives.z metadata probe FAILED: " + t);
+            XposedBridge.log(TAG + "FNatives.z legacy probe note: " + t);
+        }
+
+        // Diskwala v24 changed z() to Context + six byte arrays + two flags.
+        // Keep this observational: the native signer is still called normally.
+        try {
+            Class<?> contextClass = XposedHelpers.findClass("android.content.Context", cl);
+            XposedHelpers.findAndHookMethod("androidx.security.FNatives", cl, "z",
+                contextClass, byte[].class, byte[].class, byte[].class,
+                byte[].class, byte[].class, byte[].class, byte.class, byte.class,
+                new XC_MethodHook() {
+                    protected void beforeHookedMethod(MethodHookParam p) {
+                        byte[] nonce = (byte[]) p.args[3];
+                        byte[] dataToSign = (byte[]) p.args[4];
+                        XposedBridge.log(TAG + "FNatives.z v24 interface:"
+                            + " nonceLen=" + length(nonce)
+                            + " dataToSignLen=" + length(dataToSign)
+                            + " dataShape=" + appiCryptDataShape(dataToSign));
+                    }
+                });
+            XposedBridge.log(TAG + "FNatives.z v24 metadata probe installed");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "FNatives.z v24 probe FAILED: " + t);
         }
     }
 
@@ -356,10 +382,58 @@ public class Hook implements IXposedHookLoadPackage {
         XposedHelpers.callMethod(check, "put", "status", status);
     }
 
-    private static String toHex(byte[] value) {
+    private static boolean spoofAppiCryptCheckStatuses(Object root) {
+        Object checks = XposedHelpers.callMethod(root, "optJSONObject", "checks");
+        if (checks == null) return false;
+        Object unofficialStore = XposedHelpers.callMethod(checks, "optJSONObject", "unofficialStore");
+        Object privilegedAccess = XposedHelpers.callMethod(checks, "optJSONObject", "privilegedAccess");
+        if (unofficialStore == null || privilegedAccess == null) return false;
+
+        boolean changed = false;
+        if ("NOK".equals(XposedHelpers.callMethod(unofficialStore, "optString", "status", ""))) {
+            XposedHelpers.callMethod(unofficialStore, "put", "status", "OK");
+            changed = true;
+        }
+        if ("NOK".equals(XposedHelpers.callMethod(privilegedAccess, "optString", "status", ""))) {
+            XposedHelpers.callMethod(privilegedAccess, "put", "status", "OK");
+            changed = true;
+        }
+        return changed;
+    }
+
+    // Diagnostic output is deliberately limited to check names and their
+    // OK/NOK state. It does not log config JSON, identifiers, headers, nonce,
+    // cryptogram, or any device-state value.
+    private static String summarizeCheckStatuses(Object root) {
+        try {
+            Object checks = XposedHelpers.callMethod(root, "optJSONObject", "checks");
+            if (checks == null) return "missing";
+            Object iteratorObject = XposedHelpers.callMethod(checks, "keys");
+            if (!(iteratorObject instanceof Iterator)) return "unavailable";
+            Iterator<?> iterator = (Iterator<?>) iteratorObject;
+            StringBuilder out = new StringBuilder();
+            while (iterator.hasNext()) {
+                String name = String.valueOf(iterator.next());
+                Object check = XposedHelpers.callMethod(checks, "optJSONObject", name);
+                if (check == null) continue;
+                String status = String.valueOf(
+                    XposedHelpers.callMethod(check, "optString", "status", "unknown"));
+                if (out.length() > 0) out.append(',');
+                out.append(name).append('=').append(status);
+            }
+            return out.length() == 0 ? "empty" : out.toString();
+        } catch (Throwable ignored) {
+            return "unavailable";
+        }
+    }
+
+    private static boolean hasAcceptedDeviceId() {
+        return !SPOOF_DEVICE_ID.startsWith(DEVICE_ID_PLACEHOLDER_PREFIX);
+    }
+
+    private static String appiCryptDataShape(byte[] value) {
         if (value == null) return "null";
-        StringBuilder out = new StringBuilder(value.length * 2);
-        for (byte b : value) out.append(String.format("%02x", b & 0xff));
-        return out.toString();
+        String text = new String(value);
+        return text.contains("\"checks\"") ? "json-checks" : "opaque";
     }
 }

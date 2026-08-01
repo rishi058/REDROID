@@ -1,16 +1,14 @@
 """
-APK Static Endpoint Extractor — React Native Edition
-------------------------------------------------------
-Extracts API endpoints from an Android APK, with full support for
-React Native apps (Hermes bytecode, Metro bundle, obfuscation analysis).
+APK Static Decompiler — React Native Edition
+---------------------------------------------
+Extracts and decompiles React Native and Java layers from Android packages.
 
 Steps performed:
   1. Unzip APK → find React Native JS bundle (no jadx needed for JS layer)
   2. Detect bundle type: Hermes bytecode vs plain Metro JS
   3. Decompile Hermes with hermes-dec (if installed), else extract strings
-  4. Scan JS bundle + optional decompiled Java for URLs / HTTP calls
-  5. Analyse obfuscation level
-  6. Write output.txt (human-readable) + endpoints.json
+  4. Optionally decompile the Java/Kotlin layer with JADX
+  5. Analyse bundle obfuscation metadata
 
 Requirements:
     pip install rich
@@ -19,13 +17,12 @@ Requirements:
       jadx on PATH                           ← decompile Java bridge layer
 
 Usage:
-    python 1_apk_extractor.py --apk target-app.apk  --base api.target-app.com
-    python 1_apk_extractor.py --apk target-app.apks --base api.target-app.com
-    python 1_apk_extractor.py --apk target-app.xapk --base api.target-app.com --keep-bundle
+    python apk_extractor.py --apk target-app.apk --keep-bundle
+    python apk_extractor.py --apk target-app.apks --keep-bundle --java-dir jadx-java-src
+    python apk_extractor.py --apk target-app.xapk --keep-bundle --no-java
 """
 
 import argparse
-import concurrent.futures
 import json
 import os
 import re
@@ -36,13 +33,12 @@ import sys
 import tempfile
 import time
 import zipfile
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
 
 try:
     from rich.console import Console
-    from rich.table import Table
     console = Console()
 except ImportError:
     print("Install rich:  pip install rich")
@@ -62,44 +58,14 @@ RN_BUNDLE_NAMES = [
     "assets/app.bundle",
 ]
 
-# ── regex patterns ───────────────────────────────────────────────────────────────
+# Keep generated logs, retained Hermes output, and temporary work independent
+# from the directory used to launch this script.
+SCRIPT_DIR = Path(__file__).resolve().parent
+LOG_DIR = SCRIPT_DIR
+DEFAULT_TMP_DIR = SCRIPT_DIR / "tmp"
+DEFAULT_HERMES_OUTPUT = SCRIPT_DIR / "hermes-dec-output" / "decompiled_bundle.js"
 
-RE_FULL_URL = re.compile(r'https?://[^\s"\'`<>]+', re.IGNORECASE)
-
-RE_FETCH = re.compile(
-    r'fetch\s*\(\s*[`"\']([^`"\']+)[`"\']',
-    re.IGNORECASE,
-)
-
-RE_AXIOS = re.compile(
-    r'axios\s*\.\s*(get|post|put|patch|delete|head)\s*\(\s*[`"\']([^`"\']+)[`"\']',
-    re.IGNORECASE,
-)
-
-RE_AXIOS_CREATE = re.compile(
-    r'(?:baseURL|base_url)\s*[:=]\s*[`"\']([^`"\']+)[`"\']',
-    re.IGNORECASE,
-)
-
-RE_API_CALL = re.compile(
-    r'\.(get|post|put|patch|delete)\s*\(\s*[`"\']([^`"\']+)[`"\']',
-    re.IGNORECASE,
-)
-
-RE_PATH = re.compile(
-    r'[`"\'](\s*/(?:api|v\d+|auth|user|login|logout|register|signup|refresh'
-    r'|token|product|order|cart|payment|search|upload|category|brand|address'
-    r'|review|rating|coupon|offer|promo|notification|device|media|file|image'
-    r'|wallet|wishlist|profile|setting|config|verify|otp|forgot|reset|dashboard'
-    r'|report|admin|health|ping|status|version|faq|contact|item|listing'
-    r'|shipping|invoice|transaction|checkout)[^`"\'\\]*)[`"\']',
-    re.IGNORECASE,
-)
-
-RE_RETROFIT = re.compile(
-    r'@(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s*\(\s*["\']([^"\']+)["\']\s*\)',
-    re.IGNORECASE,
-)
+# ── bundle-analysis patterns ─────────────────────────────────────────────────────
 
 RE_STRINGS_BIN = re.compile(rb'[ -~]{4,}')   # printable ASCII runs in binary
 
@@ -107,15 +73,6 @@ RE_METRO_MODULE = re.compile(r'__d\s*\(')     # Metro bundler module wrapper
 
 RE_HEX_STRING   = re.compile(r'(?:\\x[0-9a-f]{2}){4,}', re.IGNORECASE)
 RE_SHORT_IDENTS  = re.compile(r'\b[a-z]\b')  # single-char identifiers
-
-METHOD_GUESS = {
-    "GET":    re.compile(r'\b(get|fetch|load|retrieve|list|search|find|read)\b', re.IGNORECASE),
-    "POST":   re.compile(r'\b(post|create|add|submit|send|upload|register|login|signin)\b', re.IGNORECASE),
-    "PUT":    re.compile(r'\b(put|update|edit|replace|modify)\b', re.IGNORECASE),
-    "PATCH":  re.compile(r'\b(patch)\b', re.IGNORECASE),
-    "DELETE": re.compile(r'\b(delete|remove|destroy)\b', re.IGNORECASE),
-}
-
 
 # ── Format resolver (.apk / .apks / .xapk) ──────────────────────────────────────
 
@@ -230,11 +187,16 @@ def _kill_proc_tree(pid: int):
 
 
 def run_and_log(cmd: list[str], log_filename: str, timeout: int = 180, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
-    console.print(f"[dim]Logging output to {log_filename} (timeout={timeout}s)...[/dim]")
+    log_path = Path(log_filename)
+    if not log_path.is_absolute():
+        log_path = LOG_DIR / log_path
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    console.print(f"[dim]Logging output to {log_path} (timeout={timeout}s)...[/dim]")
     process = None
     returncode = -1
     try:
-        with open(log_filename, "wb") as f:
+        with open(log_path, "wb") as f:
             process = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env)
             try:
                 process.wait(timeout=timeout)
@@ -261,7 +223,7 @@ def run_and_log(cmd: list[str], log_filename: str, timeout: int = 180, env: dict
     time.sleep(0.5)
     
     try:
-        with open(log_filename, "r", encoding="utf-8", errors="ignore") as f:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
     except Exception:
         content = ""
@@ -346,7 +308,6 @@ class ObfuscationReport:
         self.has_hex_strings = False
         self.short_ident_ratio = 0.0
         self.proguard_detected = False
-        self.base_urls: list[str] = []
 
     @property
     def level(self) -> str:
@@ -374,8 +335,6 @@ class ObfuscationReport:
             f"ProGuard (Java)  : {'Detected' if self.proguard_detected else 'Not detected'}",
             f"Obfuscation Level: {self.level}",
         ]
-        if self.base_urls:
-            lines.append(f"Base URLs found  : {', '.join(self.base_urls[:3])}")
         return lines
 
 
@@ -401,300 +360,135 @@ def analyse_obfuscation(text: str, bundle_path: str, apk_root: str) -> Obfuscati
             if re.search(r'\.class\s+\w+\s+L[a-z]/[a-z];', sample):
                 r.proguard_detected = True
 
-    for m in RE_AXIOS_CREATE.finditer(text):
-        r.base_urls.append(m.group(1))
-
     return r
-
-
-# ── Endpoint scanning ────────────────────────────────────────────────────────────
-
-Findings = dict[str, set]   # path → set of HTTP methods
-
-
-def scan_js(text: str, domain: str, findings: Findings):
-    """Scan JS bundle text for API endpoints."""
-
-    # 1. Full URLs containing domain
-    for m in RE_FULL_URL.finditer(text):
-        url = m.group(0).rstrip('",;)`\\')
-        if domain in url:
-            parsed = urlparse(url)
-            path = parsed.path
-            if path and path not in ("", "/"):
-                ctx = text[max(0, m.start()-100):m.start()+100]
-                findings.setdefault(path, set()).add(_guess_method(ctx))
-
-    # 2. fetch('...')
-    for m in RE_FETCH.finditer(text):
-        path = m.group(1).rstrip('",;)')
-        if _is_path(path, domain):
-            ctx = text[max(0, m.start()-60):m.start()+60]
-            findings.setdefault(_normalise(path), set()).add(_guess_method(ctx) or "GET")
-
-    # 3. axios.get/post/...('/path')
-    for m in RE_AXIOS.finditer(text):
-        method, path = m.group(1).upper(), m.group(2).rstrip('",;)')
-        if _is_path(path, domain):
-            findings.setdefault(_normalise(path), set()).add(method)
-
-    # 4. Generic .get/.post('..')  (custom API client)
-    for m in RE_API_CALL.finditer(text):
-        method, path = m.group(1).upper(), m.group(2).rstrip('",;)')
-        if _is_path(path, domain):
-            findings.setdefault(_normalise(path), set()).add(method)
-
-    # 5. Bare path strings  "/api/v1/..."
-    for m in RE_PATH.finditer(text):
-        path = m.group(1).strip()
-        if path:
-            ctx = text[max(0, m.start()-80):m.start()+80]
-            findings.setdefault(path, set()).add(_guess_method(ctx) or "GET")
-
-
-def _scan_java_file(args_tuple: tuple) -> list[tuple[str, str]]:
-    """Worker function for parallel Java scanning. Returns list of (method, path) tuples."""
-    fpath, domain = args_tuple
-    results = []
-    try:
-        text = Path(fpath).read_text(errors="ignore")
-    except Exception:
-        return results
-    for m in RE_RETROFIT.finditer(text):
-        method, path = m.group(1).upper(), m.group(2)
-        if not path.startswith("/"):
-            path = "/" + path
-        results.append((method, path))
-    for m in RE_FULL_URL.finditer(text):
-        url = m.group(0).rstrip('",;)')
-        if domain in url:
-            parsed = urlparse(url)
-            p = parsed.path
-            if p and p not in ("", "/"):
-                ctx = text[max(0, m.start()-80):m.start()+80]
-                results.append((_guess_method(ctx), p))
-    return results
-
-
-def scan_java(base_dir: str, domain: str, findings: Findings) -> int:
-    """Scan decompiled Java/Kotlin for Retrofit annotations using multiprocessing."""
-    extensions = {".java", ".kt", ".smali"}
-    console.print("[cyan]Collecting decompiled Java/Smali files...[/cyan]")
-    
-    file_list = []
-    for root, _, files in os.walk(base_dir):
-        for fname in files:
-            if Path(fname).suffix.lower() in extensions:
-                file_list.append(os.path.join(root, fname))
-    
-    total = len(file_list)
-    if total == 0:
-        console.print("[yellow]No Java/Kotlin/Smali files found.[/yellow]")
-        return 0
-    
-    workers = min(os.cpu_count() or 4, 8)
-    console.print(f"[cyan]Scanning {total} files with {workers} workers...[/cyan]")
-    
-    t0 = time.time()
-    done = 0
-    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
-        work = [(fp, domain) for fp in file_list]
-        for result in executor.map(_scan_java_file, work, chunksize=256):
-            done += 1
-            if done % 5000 == 0:
-                elapsed = time.time() - t0
-                console.print(f"[dim]  ...scanned {done}/{total} files ({elapsed:.1f}s)...[/dim]")
-            for method, path in result:
-                findings.setdefault(path, set()).add(method)
-    
-    elapsed = time.time() - t0
-    console.print(f"[green]Scanned {total} files in {elapsed:.1f}s[/green]")
-    return total
-
-
-def _is_path(s: str, domain: str) -> bool:
-    if not s:
-        return False
-    if s.startswith("http"):
-        return domain in s
-    return s.startswith("/") and len(s) > 2
-
-
-def _normalise(path: str) -> str:
-    if path.startswith("http"):
-        p = urlparse(path).path
-        return p if p else "/"
-    return path
-
-
-def _guess_method(ctx: str) -> str:
-    for method, pattern in METHOD_GUESS.items():
-        if pattern.search(ctx):
-            return method
-    return "GET"
 
 
 # ── Decompile Java layer (optional) ─────────────────────────────────────────────
 
-def decompile_java(apk_path: str, out_dir: str) -> bool:
-    if os.path.exists(out_dir) and any(os.scandir(out_dir)):
-        console.print(f"[green]Reusing existing Java decompilation in {out_dir}[/green]")
+def _has_java_output(out_dir: Path) -> bool:
+    ignored = {".gitkeep", ".jadx-complete.json", ".jadx-partial.json"}
+    return out_dir.exists() and any(entry.name not in ignored for entry in out_dir.iterdir())
+
+
+def _write_jadx_marker(path: Path, status: str, apk_path: str, returncode: int | None = None):
+    path.write_text(json.dumps({
+        "status": status,
+        "resumable": False,
+        "apk": str(Path(apk_path).resolve()),
+        "returncode": returncode,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "note": "JADX CLI has no resume support; use --restart-java for a clean rerun.",
+    }, indent=2), encoding="utf-8")
+
+
+def decompile_java(
+    apk_path: str,
+    out_dir: str,
+    *,
+    restart: bool = False,
+    timeout: int = 1200,
+    tmp_dir: str | None = None,
+) -> bool:
+    out_path = Path(out_dir)
+    complete_marker = out_path / ".jadx-complete.json"
+    partial_marker = out_path / ".jadx-partial.json"
+
+    if restart and out_path.exists():
+        console.print(f"[yellow]Restarting JADX from zero in {out_path}[/yellow]")
+        for entry in out_path.iterdir():
+            if entry.name == ".gitkeep":
+                continue
+            if entry.is_dir():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+
+    if _has_java_output(out_path):
+        if complete_marker.exists():
+            console.print(f"[green]Reusing completed Java decompilation in {out_path}[/green]")
+        else:
+            if not partial_marker.exists():
+                _write_jadx_marker(partial_marker, "partial-or-unverified", apk_path)
+            console.print(
+                f"[yellow]Reusing partial Java output in {out_path}. "
+                "JADX cannot resume; pass --restart-java to start again from zero.[/yellow]"
+            )
         return True
 
     jadx_path = shutil.which("jadx")
     if jadx_path:
+        out_path.mkdir(parents=True, exist_ok=True)
         console.print("[cyan]Running jadx on Java/Kotlin layer...[/cyan]")
         env = os.environ.copy()
         env["JAVA_OPTS"] = env.get("JAVA_OPTS", "") + " -Xmx4g"
-        r = run_and_log([jadx_path, "-d", out_dir, "--no-res", apk_path], "jadx.log", timeout=720, env=env)
-        return r.returncode == 0 or Path(out_dir).exists()
+        jadx_tmp = Path(tmp_dir) if tmp_dir else DEFAULT_TMP_DIR
+        jadx_tmp.mkdir(parents=True, exist_ok=True)
+        (jadx_tmp / "jadx-tmp").mkdir(parents=True, exist_ok=True)
+        (jadx_tmp / "jadx-cache").mkdir(parents=True, exist_ok=True)
+        env["JADX_TMP_DIR"] = str((jadx_tmp / "jadx-tmp").resolve())
+        env["JADX_CACHE_DIR"] = str((jadx_tmp / "jadx-cache").resolve())
+
+        complete_marker.unlink(missing_ok=True)
+        partial_marker.unlink(missing_ok=True)
+        r = run_and_log(
+            [jadx_path, "-d", out_dir, "--no-res", apk_path],
+            "jadx.log",
+            timeout=timeout,
+            env=env,
+        )
+        if r.returncode == 0:
+            _write_jadx_marker(complete_marker, "complete", apk_path, r.returncode)
+            return True
+        if _has_java_output(out_path):
+            _write_jadx_marker(partial_marker, "partial", apk_path, r.returncode)
+            console.print(
+                f"[yellow]JADX output is partial and was preserved in {out_path}. "
+                "It cannot resume from this percentage.[/yellow]"
+            )
+            return True
+        return False
     
     apktool_path = shutil.which("apktool")
     if apktool_path:
         console.print("[cyan]Running apktool (smali only)...[/cyan]")
-        r = run_and_log([apktool_path, "d", "-f", "-o", out_dir, apk_path], "apktool.log", timeout=720)
-        return r.returncode == 0 or Path(out_dir).exists()
+        r = run_and_log([apktool_path, "d", "-f", "-o", out_dir, apk_path], "apktool.log", timeout=timeout)
+        return r.returncode == 0 or _has_java_output(out_path)
     return False
-
-
-# ── Output ───────────────────────────────────────────────────────────────────────
-
-def write_output_txt(
-    out_path: str,
-    apk_name: str,
-    domain: str,
-    findings: Findings,
-    obf: ObfuscationReport,
-    raw_urls: list[str],
-):
-    rows: list[tuple[str, str]] = []
-    for path, methods in sorted(findings.items()):
-        for method in sorted(methods):
-            rows.append((method, path))
-    rows.sort(key=lambda r: (r[1], r[0]))
-
-    by_method: dict[str, list[str]] = {}
-    for method, path in rows:
-        by_method.setdefault(method, []).append(path)
-
-    W = 80
-    sep  = "=" * W
-    dash = "─" * W
-
-    lines = [
-        sep,
-        "  API ENDPOINT EXTRACTION REPORT",
-        f"  App    : {apk_name}",
-        f"  Target : {domain}",
-        f"  Date   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        sep,
-        "",
-        "OBFUSCATION ANALYSIS",
-        dash,
-        *obf.summary_lines(),
-        "",
-        sep,
-        f"ENDPOINTS FOUND  ({len(findings)} unique paths, {len(rows)} method+path combos)",
-        sep,
-        "",
-        f"{'METHOD':<10} ENDPOINT",
-        dash,
-    ]
-
-    for method, path in rows:
-        lines.append(f"{method:<10} {path}")
-
-    lines += ["", dash, "BY METHOD", dash]
-    for method in ["GET", "POST", "PUT", "PATCH", "DELETE"]:
-        paths = by_method.get(method, [])
-        if paths:
-            lines.append(f"\n{method} ({len(paths)}):")
-            for p in paths:
-                lines.append(f"  {p}")
-
-    lines += [
-        "", sep,
-        "RAW FULL URLS FOUND",
-        sep,
-    ]
-    for u in sorted(set(raw_urls)):
-        lines.append(f"  {u}")
-
-    if not raw_urls:
-        lines.append("  (none — domain not seen as full URL in bundle)")
-
-    lines += [
-        "",
-        sep,
-        "NOTES ON OBFUSCATION",
-        dash,
-    ]
-    if obf.is_hermes:
-        if obf.decompiled_ok:
-            lines.append("  Hermes bytecode was decompiled with hermes-dec.")
-            lines.append("  Decompiled JS may still have short variable names (Metro minification).")
-        else:
-            lines.append("  Hermes bytecode detected but hermes-dec not installed.")
-            lines.append("  Install with:  pip install hermes-dec")
-            lines.append("  Endpoints were extracted from raw string table in binary.")
-    if obf.proguard_detected:
-        lines.append("  ProGuard/R8 detected on Java layer. Class/method names are mangled.")
-        lines.append("  This does NOT affect the React Native JS bundle.")
-    if obf.short_ident_ratio > 0.6:
-        lines.append("  High density of single-char identifiers — Metro minification active.")
-        lines.append("  Tip: look for baseURL / BASE_URL string constants to confirm domain.")
-    lines += ["", sep]
-
-    Path(out_path).write_text("\n".join(lines), encoding="utf-8")
-    console.print(f"[green]output.txt written → {out_path}[/green]")
-
-
-def print_rich_table(findings: Findings):
-    table = Table(show_header=True, header_style="bold magenta")
-    table.add_column("Method", style="bold", width=10)
-    table.add_column("Endpoint")
-
-    METHOD_COLOR = {"GET": "green", "POST": "yellow", "PUT": "blue",
-                    "PATCH": "magenta", "DELETE": "red"}
-
-    rows = sorted(
-        [(m, p) for p, methods in findings.items() for m in methods],
-        key=lambda x: (x[1], x[0]),
-    )
-    for method, path in rows:
-        c = METHOD_COLOR.get(method, "white")
-        table.add_row(f"[{c}]{method}[/{c}]", path)
-
-    console.print(table)
-    console.print(f"\n[bold]Total unique endpoints: {len(findings)}[/bold]")
 
 
 # ── main ─────────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract API endpoints from a React Native APK / APKS / XAPK.",
+        description="Extract and decompile React Native APK / APKS / XAPK content.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Supported input formats:
   .apk   Plain Android APK
-  .apks  Android App Bundle splits (bundletool output) — base.apk is used
-  .xapk  APKPure multi-APK archive — main APK resolved via manifest.json
+  .apks  Android App Bundle splits (bundletool output) - base.apk is used
+  .xapk  APKPure multi-APK archive - main APK resolved via manifest.json
 
 Examples:
-  python 1_apk_extractor.py --apk target-app.apk   --base api.target-app.com
-  python 1_apk_extractor.py --apk target-app.apks  --base api.target-app.com
-  python 1_apk_extractor.py --apk target-app.xapk  --base api.target-app.com --keep-bundle
+  python apk_extractor.py --apk target-app.apk --keep-bundle
+  python apk_extractor.py --apk target-app.apks --keep-bundle --java-dir jadx-java-src
+  python apk_extractor.py --apk target-app.xapk --keep-bundle --no-java
 """,
     )
     parser.add_argument("--apk",          required=True,
                         help="Path to .apk / .apks / .xapk file")
-    parser.add_argument("--base",         default="api.target-app.com", help="API domain to target")
-    parser.add_argument("--out",          default="output.txt",       help="Human-readable report")
-    parser.add_argument("--json",         default="endpoints.json",   help="JSON output")
     parser.add_argument("--keep-bundle",  action="store_true",        help="Save decompiled JS bundle")
+    parser.add_argument("--bundle-out",   default=str(DEFAULT_HERMES_OUTPUT),
+                        help="Retained Hermes/Metro output path (default: apk-extractor/hermes-dec-output/decompiled_bundle.js)")
     parser.add_argument("--no-java",      action="store_true",        help="Skip jadx Java decompile")
     parser.add_argument("--java-dir",     help="Directory to cache/reuse decompiled Java code")
+    parser.add_argument("--java-timeout", type=int, default=1200,
+                        help="JADX/apktool timeout in seconds (default: 1200)")
+    parser.add_argument("--restart-java", action="store_true",
+                        help="Delete partial Java output and rerun JADX from zero (JADX cannot resume)")
+    parser.add_argument("--tmp-dir",      default=str(DEFAULT_TMP_DIR),
+                        help="Temporary/cache root (default: apk-extractor/tmp)")
+    parser.add_argument("--keep-temp",    action="store_true",
+                        help="Retain the per-run temporary directory for inspection")
     args = parser.parse_args()
 
     input_path = Path(args.apk)
@@ -708,11 +502,18 @@ Examples:
                       f"Use one of: {', '.join(sorted(valid_exts))}[/red]")
         sys.exit(1)
 
-    domain = args.base.replace("https://", "").replace("http://", "").split("/")[0]
-    findings: Findings = {}
-    raw_urls: list[str] = []
+    tmp_root = Path(args.tmp_dir).resolve()
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    if args.keep_temp:
+        tmp_context = nullcontext(tempfile.mkdtemp(prefix="run-", dir=tmp_root))
+    else:
+        tmp_context = tempfile.TemporaryDirectory(
+            prefix="run-",
+            dir=tmp_root,
+            ignore_cleanup_errors=True,
+        )
 
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+    with tmp_context as tmp:
         # Step 0 — resolve .apks / .xapk → plain .apk
         apk_path = Path(resolve_to_apk(str(input_path), tmp))
 
@@ -734,14 +535,18 @@ Examples:
 
             if is_hermes:
                 console.print(f"[yellow]Hermes bytecode detected (version {hv})[/yellow]")
-                dec_path = os.path.join(tmp, "bundle_decompiled.js")
+                if args.keep_bundle:
+                    dec_path = str(Path(args.bundle_out).resolve())
+                    Path(dec_path).parent.mkdir(parents=True, exist_ok=True)
+                    Path(dec_path).unlink(missing_ok=True)
+                else:
+                    dec_path = os.path.join(tmp, "bundle_decompiled.js")
                 obf.decompiled_ok = decompile_hermes(bundle_path, dec_path)
 
                 if obf.decompiled_ok:
                     js_text = Path(dec_path).read_text(errors="ignore")
                     if args.keep_bundle:
-                        shutil.copy(dec_path, "decompiled_bundle.js")
-                        console.print("[dim]Decompiled JS saved → decompiled_bundle.js[/dim]")
+                        console.print(f"[dim]Decompiled JS saved directly → {dec_path}[/dim]")
                 else:
                     console.print("[yellow]Extracting strings from Hermes binary...[/yellow]")
                     js_text = extract_strings_from_binary(bundle_path)
@@ -750,8 +555,10 @@ Examples:
                 js_text = Path(bundle_path).read_text(errors="ignore")
                 js_text = beautify_js(js_text)
                 if args.keep_bundle:
-                    Path("bundle_beautified.js").write_text(js_text)
-                    console.print("[dim]Beautified JS saved → bundle_beautified.js[/dim]")
+                    bundle_out = Path(args.bundle_out).resolve()
+                    bundle_out.parent.mkdir(parents=True, exist_ok=True)
+                    bundle_out.write_text(js_text, encoding="utf-8")
+                    console.print(f"[dim]Beautified JS saved → {bundle_out}[/dim]")
 
             # Fill remaining obfuscation fields
             obf.is_metro         = bool(RE_METRO_MODULE.search(js_text[:50_000]))
@@ -759,27 +566,8 @@ Examples:
             words = re.findall(r'\b[a-zA-Z_]\w*\b', js_text[:50_000])
             short = sum(1 for w in words if len(w) == 1)
             obf.short_ident_ratio = short / max(len(words), 1)
-            for m in RE_AXIOS_CREATE.finditer(js_text):
-                obf.base_urls.append(m.group(1))
-
-            # Scan JS
-            scan_js(js_text, domain, findings)
-
-            # Collect raw URLs
-            for m in RE_FULL_URL.finditer(js_text):
-                u = m.group(0).rstrip('",;)`\\')
-                if domain in u:
-                    raw_urls.append(u)
-
         else:
-            # No bundle — scan all .js files extracted from APK
-            for fpath in Path(apk_root).rglob("*.js"):
-                text = fpath.read_text(errors="ignore")
-                scan_js(text, domain, findings)
-                for m in RE_FULL_URL.finditer(text):
-                    u = m.group(0).rstrip('",;)`\\')
-                    if domain in u:
-                        raw_urls.append(u)
+            console.print("[yellow]No React Native bundle was available for decompilation.[/yellow]")
 
         # Step 3 — optional Java layer
         if not args.no_java:
@@ -789,31 +577,36 @@ Examples:
             else:
                 java_dir = os.path.join(tmp, "java")
                 
-            if decompile_java(str(apk_path), java_dir):
-                n = scan_java(java_dir, domain, findings)
-                console.print(f"[dim]Java layer: scanned {n} files.[/dim]")
+            if decompile_java(
+                str(apk_path),
+                java_dir,
+                restart=args.restart_java,
+                timeout=args.java_timeout,
+                tmp_dir=str(tmp_root),
+            ):
+                extensions = {".java", ".kt", ".smali"}
+                n = sum(
+                    1 for path in Path(java_dir).rglob("*")
+                    if path.is_file() and path.suffix.lower() in extensions
+                )
+                console.print(f"[dim]Java layer contains {n} decompiled source files.[/dim]")
                 # ProGuard check
                 if (Path(java_dir) / "mapping.txt").exists():
                     obf.proguard_detected = True
 
-    # ── Print + save ──────────────────────────────────────────────────────────
-    console.print("\n[bold cyan]── Obfuscation Report ──[/bold cyan]")
-    for line in obf.summary_lines():
-        console.print(f"  {line}")
+        if args.keep_temp:
+            console.print(f"[yellow]Temporary files retained → {tmp}[/yellow]")
 
-    console.print("\n[bold cyan]── Endpoints ──[/bold cyan]")
-    print_rich_table(findings)
-
-    write_output_txt(args.out, input_path.name, domain, findings, obf, raw_urls)
-
-    rows = sorted(
-        [(m, p) for p, methods in findings.items() for m in methods],
-        key=lambda x: (x[1], x[0]),
-    )
-    Path(args.json).write_text(json.dumps(
-        [{"method": m, "path": p} for m, p in rows], indent=2
-    ))
-    console.print(f"[dim]JSON saved → {args.json}[/dim]")
+    console.print("\n[bold cyan]── Extraction Summary ──[/bold cyan]")
+    if bundle_path:
+        for line in obf.summary_lines():
+            console.print(f"  {line}")
+    if args.keep_bundle:
+        console.print(f"  Retained bundle   : {Path(args.bundle_out).resolve()}")
+    if not args.no_java:
+        console.print(f"  Java output       : {Path(java_dir).resolve()}")
+    console.print(f"  Logs              : {LOG_DIR}")
+    console.print(f"  Temporary root    : {tmp_root}")
 
 
 if __name__ == "__main__":

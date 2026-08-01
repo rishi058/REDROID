@@ -24,12 +24,9 @@ icacls.exe "C:/Users/YOUR_WINDOWS_USER/.ssh/YOUR_PRIVATE_KEY.key" /grant:r "$($e
 
 ## CMD to enter VPS 
 
-ssh -i "oracle.key" ubuntu@YOUR_PUBLIC_IP
+ssh -i "C:/Users/Rishi/.ssh/ssh-key-2026-07-06(pvt).key" -o StrictHostKeyChecking=no ubuntu@141.148.151.172
 
-ssh -i "C:/Users/YOUR_WINDOWS_USER/.ssh/YOUR_PRIVATE_KEY.key" -o StrictHostKeyChecking=no ubuntu@YOUR_VPS_PUBLIC_IP
-
-
-# Connecting PORT 
+# Connecting PORT to use "adb connect 127.0.0.1:5555"
 
 ssh -i "C:/Users/Rishi/.ssh/ssh-key-2026-07-06(pvt).key" `
   -o ExitOnForwardFailure=yes `

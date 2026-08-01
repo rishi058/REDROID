@@ -25,6 +25,7 @@ Thumbs.db
 *.swp
 *.swo
 
+.kilo
 __pycache__   
 *.mitm
 secrets 
@@ -43,6 +44,10 @@ rev-eng/apk-extractor/target-apk/**
 !rev-eng/apk-extractor/target-apk/
 !rev-eng/apk-extractor/target-apk/.gitkeep
 
+rev-eng/apk-extractor/tmp/**
+!rev-eng/apk-extractor/tmp/
+!rev-eng/apk-extractor/tmp/.gitkeep
+
 rev-eng/network-tools/captures/**
 !rev-eng/network-tools/captures/
 !rev-eng/network-tools/captures/.gitkeep
@@ -55,6 +60,4 @@ rev-eng/network-tools/certs/**
 rev-eng/modules/secrets/**
 !rev-eng/modules/secrets/
 !rev-eng/modules/secrets/.gitkeep
-
-
 
