@@ -57,6 +57,11 @@ public class Hook implements IXposedHookLoadPackage {
     // Log FNatives.z return-value size and the set of threats that fired before
     // it was invoked (key diagnostic: which RASP signals are in the cryptogram).
     private static final boolean LOG_FNATIVES_Z_RETURN   = true;
+    // RevenueCat's default getCustomerInfo() path can wait indefinitely for a
+    // broken Play Billing connection before returning data that is already in
+    // its persisted native cache. Resolve the React Native promise from that
+    // real cache when available; never fabricate an entitlement or customer.
+    private static final boolean USE_CACHED_REVENUECAT_CUSTOMER_INFO = true;
 
     // ── mutable state ────────────────────────────────────────────────────────
     private static boolean loggedAppiCryptCheckSchema = false;
@@ -122,6 +127,9 @@ public class Hook implements IXposedHookLoadPackage {
         }
         if (LOG_CRYPTOGRAM_RESULT) {
             hookCryptogramResult(cl);
+        }
+        if (USE_CACHED_REVENUECAT_CUSTOMER_INFO) {
+            hookCachedRevenueCatCustomerInfo(cl);
         }
 
         // 1) Keep native freeRASP/AppiCrypt initialization enabled by default.
@@ -598,6 +606,71 @@ public class Hook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + "getCryptogram logging hook installed");
         } catch (Throwable t) {
             XposedBridge.log(TAG + "getCryptogram hook note: " + t);
+        }
+    }
+
+    // RevenueCat 9.12.0's normal CACHED_OR_FETCHED path synchronises pending
+    // Play purchases before a cache-miss fetch. On this Redroid image the Play
+    // Billing client remains in CONNECTING, leaving the React Native Promise
+    // unresolved and FileInfo permanently loading. Return a complete cached
+    // CustomerInfo through RevenueCat's own mapper when one exists. Diskwala
+    // already handles null as non-premium, so use null on a cache miss rather
+    // than leaving the Promise pending forever.
+    private void hookCachedRevenueCatCustomerInfo(final ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                "com.revenuecat.purchases.react.RNPurchasesModule", cl,
+                "getCustomerInfo", "com.facebook.react.bridge.Promise",
+                new XC_MethodHook() {
+                    protected void beforeHookedMethod(MethodHookParam p) {
+                        try {
+                            Class<?> purchasesClass = XposedHelpers.findClass(
+                                "com.revenuecat.purchases.Purchases", cl);
+                            Object companion = XposedHelpers.getStaticObjectField(
+                                purchasesClass, "Companion");
+                            Object purchases = XposedHelpers.callMethod(
+                                companion, "getSharedInstance");
+                            String appUserId = (String) XposedHelpers.callMethod(
+                                purchases, "getAppUserID");
+                            Object orchestrator = XposedHelpers.getObjectField(
+                                purchases, "purchasesOrchestrator");
+                            Object deviceCache = XposedHelpers.getObjectField(
+                                orchestrator, "deviceCache");
+                            Object customerInfo = XposedHelpers.callMethod(
+                                deviceCache, "getCachedCustomerInfo", appUserId);
+                            if (customerInfo == null) {
+                                // Diskwala already treats null CustomerInfo as a
+                                // non-premium state. Resolving null is preferable
+                                // to leaving every FileInfo request blocked behind
+                                // a BillingClient connection that never completes.
+                                XposedHelpers.callMethod(p.args[0], "resolve", (Object) null);
+                                p.setResult(null);
+                                XposedBridge.log(TAG + "RevenueCat CustomerInfo cache miss; resolved null");
+                                return;
+                            }
+
+                            Class<?> mapper = XposedHelpers.findClass(
+                                "com.revenuecat.purchases.hybridcommon.mappers.CustomerInfoMapperKt", cl);
+                            Object mapped = XposedHelpers.callStaticMethod(
+                                mapper, "map", customerInfo);
+                            Class<?> arguments = XposedHelpers.findClass(
+                                "com.facebook.react.bridge.Arguments", cl);
+                            Object nativeMap = XposedHelpers.callStaticMethod(
+                                arguments, "makeNativeMap", mapped);
+                            XposedHelpers.callMethod(p.args[0], "resolve", nativeMap);
+                            p.setResult(null);
+                            XposedBridge.log(TAG + "RevenueCat getCustomerInfo resolved from native cache");
+                        } catch (Throwable t) {
+                            // Preserve the SDK's original behaviour if its object
+                            // graph or mapper changes in a future app release.
+                            XposedBridge.log(TAG + "RevenueCat cache hook fallback: "
+                                + t.getClass().getName());
+                        }
+                    }
+                });
+            XposedBridge.log(TAG + "RevenueCat native-cache hook installed");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "RevenueCat cache hook note: " + t);
         }
     }
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 """Capture Android HTTP(S) traffic through mitmproxy into a timestamped JSON file.
 
 Run this file normally.  It starts mitmdump, points the connected Android device
@@ -231,6 +231,37 @@ def run_adb(adb: str, serial: str | None, *args: str, check: bool = True) -> sub
     return subprocess.run(adb_command(adb, serial, *args), text=True, check=check)
 
 
+def connected_devices(adb: str) -> list[str]:
+    """Return usable ADB serials, excluding offline/unauthorized entries."""
+    result = subprocess.run(
+        [adb, "devices"],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    devices: list[str] = []
+    for line in result.stdout.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 2 and fields[1] == "device":
+            devices.append(fields[0])
+    return devices
+
+
+def resolve_serial(adb: str, serial: str | None) -> str | None:
+    """Resolve an omitted serial when exactly one device is connected."""
+    if serial:
+        return serial
+    devices = connected_devices(adb)
+    if len(devices) == 1:
+        return devices[0]
+    if not devices:
+        raise ValueError("no usable ADB device is connected")
+    raise ValueError(
+        "multiple ADB devices are connected; pass --serial with one of: "
+        + ", ".join(devices)
+    )
+
+
 def get_proxy(adb: str, serial: str | None) -> str:
     result = subprocess.run(
         adb_command(adb, serial, "shell", "settings", "get", "global", "http_proxy"),
@@ -272,6 +303,11 @@ def main() -> int:
         parser.error("--port must be between 1 and 65535")
     if not shutil.which(args.mitmdump) and not Path(args.mitmdump).exists():
         parser.error(f"mitmdump was not found: {args.mitmdump!r}. Install mitmproxy or pass --mitmdump.")
+
+    try:
+        args.serial = resolve_serial(args.adb, args.serial)
+    except (FileNotFoundError, subprocess.CalledProcessError, ValueError) as exc:
+        parser.error(f"ADB device selection failed: {exc}")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")

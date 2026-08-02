@@ -860,3 +860,639 @@ The decisive Target-App result came from item 3. Strong Integrity was useful as 
 control, but the backend continued returning 403 until the AppiCrypt cryptogram
 contained an all-clean check-state set. Once that state was signed by the
 genuine `FNatives.z()` implementation, the protected request returned HTTP 200.
+
+## 16. Unblock the link-submission file-information request
+
+Date: 2026-08-02
+
+This follow-up started after the protected initialization request was already
+returning HTTP 200. The remaining symptom was different:
+
+1. Target-App's home page accepted a valid shared-link URL.
+2. Pressing the submit arrow navigated to the File Info screen.
+3. The screen remained on its loading state indefinitely.
+4. No Target-App file-information request appeared in the network capture.
+
+The submit control itself was therefore not broken. Navigation completed, but
+the asynchronous File Info initialization stopped before AppiCrypt signing and
+before the HTTP request.
+
+As elsewhere in this guide, app-specific route strings, target links, package
+names, capture filenames, account identifiers, and response contents are not
+reproduced. The two routes are called the **non-premium file-info v3 route** and
+the **premium file-info v3 route** below.
+
+### 16.1 Recover the stopped Redroid runtime
+
+The container was initially stopped. Its state was checked and it was started
+without recreating it:
+
+```powershell
+$SshKey = "<SSH_KEY>"
+$VpsHost = "<VPS_HOST>"
+$Remote = "ubuntu@$VpsHost"
+$Container = "redroid14-ksu"
+$AdbSerial = "127.0.0.1:5555"
+$TargetPackage = "<TARGET_PACKAGE>"
+$TargetActivity = "<TARGET_PACKAGE>/.MainActivity"
+$TargetLink = "<TARGET_LINK>"
+
+ssh -i $SshKey -o StrictHostKeyChecking=no $Remote `
+  "sudo docker ps -a --filter name=$Container --format '{{.Names}}|{{.Status}}'"
+
+ssh -i $SshKey -o StrictHostKeyChecking=no $Remote `
+  "sudo docker start $Container; sleep 8; sudo docker ps --filter name=$Container --format '{{.Names}}|{{.Status}}'"
+```
+
+The local ADB tunnel was then opened and Android boot completion was checked:
+
+```powershell
+ssh -i $SshKey `
+  -o StrictHostKeyChecking=no `
+  -o ExitOnForwardFailure=yes `
+  -o ServerAliveInterval=30 `
+  -N `
+  -L 127.0.0.1:5555:127.0.0.1:5555 `
+  $Remote
+
+adb connect $AdbSerial
+adb -s $AdbSerial wait-for-device
+
+$Deadline = (Get-Date).AddMinutes(2)
+do {
+  $BootCompleted = (adb -s $AdbSerial shell getprop sys.boot_completed).Trim()
+  if ($BootCompleted -eq "1") { break }
+  Start-Sleep -Seconds 3
+} while ((Get-Date) -lt $Deadline)
+
+if ($BootCompleted -ne "1") {
+  throw "Redroid did not finish booting"
+}
+```
+
+### 16.2 Repair the LSPosed module state first
+
+The first launch died before the link workflow could be tested. Runtime logs did
+not contain the expected TalsecKill startup lines. Package inspection showed
+that both LSPosed module APKs had current randomized Android paths, while
+LSPosed's database still referenced older paths.
+
+The packages and paths were checked with:
+
+```powershell
+adb -s $AdbSerial shell dumpsys package $TargetPackage | `
+  findstr /I "versionName versionCode installerPackageName initiatingPackageName"
+
+adb -s $AdbSerial shell pm path com.recon.talsecbypass
+adb -s $AdbSerial shell pm path `
+  io.github.ahmedmani.io.github.ahmedmani.pairipfixio.github.ahmedmani.pairipfix
+
+ssh -i $SshKey -o StrictHostKeyChecking=no $Remote `
+  "sudo docker exec $Container /data/adb/ksud module list"
+```
+
+The modules were reinstalled. PairIPFix retained the previously established
+double-install requirement:
+
+```powershell
+adb -s $AdbSerial install -r "rev-eng\modules\pairipfix.apk"
+adb -s $AdbSerial install -r "rev-eng\modules\pairipfix.apk"
+adb -s $AdbSerial install -r "rev-eng\modules\talseckill.apk"
+```
+
+After retrieving both new `pm path` values, LSPosed's `modules.apk_path`,
+`enabled`, and Target-App scope rows were repaired. Before hardening, direct
+Android `sqlite3` happened to work for one repair:
+
+```sql
+UPDATE modules
+SET enabled = 1,
+    apk_path = '<CURRENT_TALSECKILL_BASE_APK_PATH>'
+WHERE module_pkg_name = 'com.recon.talsecbypass';
+
+UPDATE modules
+SET enabled = 1,
+    apk_path = '<CURRENT_PAIRIPFIX_BASE_APK_PATH>'
+WHERE module_pkg_name =
+  'io.github.ahmedmani.io.github.ahmedmani.pairipfixio.github.ahmedmani.pairipfix';
+
+INSERT OR IGNORE INTO scope(mid, app_pkg_name, user_id)
+SELECT mid, '<TARGET_PACKAGE>', 0
+FROM modules
+WHERE module_pkg_name IN (
+  'com.recon.talsecbypass',
+  'io.github.ahmedmani.io.github.ahmedmani.pairipfixio.github.ahmedmani.pairipfix'
+);
+```
+
+After later hardening/reboots, ADB again ran as the unprivileged `shell` user and
+could not access `/data/adb/lspd`. The safe writer-freeze procedure in section 8
+was used for every subsequent TalsecKill APK path update:
+
+```powershell
+# Verify the remote temporary parent before creating a work directory.
+ssh -i $SshKey -o StrictHostKeyChecking=no $Remote `
+  "test -d /tmp && echo REMOTE_TMP_OK"
+
+# On the VPS, freeze lspd, copy DB+WAL+SHM, update with host sqlite3,
+# checkpoint, copy the DB back, and remove stale sidecars while frozen.
+ssh -i $SshKey -o StrictHostKeyChecking=no $Remote @'
+set -e
+container=redroid14-ksu
+work=/tmp/lspd-db-fix-$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -m 700 "$work"
+
+pid=$(sudo docker exec "$container" pidof lspd)
+sudo docker exec "$container" kill -STOP "$pid"
+
+sudo docker cp \
+  "$container":/data/adb/lspd/config/modules_config.db \
+  "$work/modules_config.db"
+sudo docker cp \
+  "$container":/data/adb/lspd/config/modules_config.db-wal \
+  "$work/modules_config.db-wal" || true
+sudo docker cp \
+  "$container":/data/adb/lspd/config/modules_config.db-shm \
+  "$work/modules_config.db-shm" || true
+
+sudo chown -R ubuntu:ubuntu "$work"
+tar -C "$work" -czf "$work/original-db-files.tgz" \
+  modules_config.db modules_config.db-wal modules_config.db-shm
+
+sqlite3 "$work/modules_config.db" <<'SQL'
+UPDATE modules
+SET enabled = 1,
+    apk_path = '<CURRENT_TALSECKILL_BASE_APK_PATH>'
+WHERE module_pkg_name = 'com.recon.talsecbypass';
+
+INSERT OR IGNORE INTO scope(mid, app_pkg_name, user_id)
+SELECT mid, '<TARGET_PACKAGE>', 0
+FROM modules
+WHERE module_pkg_name = 'com.recon.talsecbypass';
+
+PRAGMA wal_checkpoint(TRUNCATE);
+SQL
+
+sqlite3 "$work/modules_config.db" \
+  "SELECT mid,enabled,module_pkg_name,apk_path FROM modules WHERE module_pkg_name='com.recon.talsecbypass'; SELECT mid,app_pkg_name,user_id FROM scope WHERE app_pkg_name='<TARGET_PACKAGE>';"
+
+sudo docker cp "$work/modules_config.db" \
+  "$container":/data/adb/lspd/config/modules_config.db
+
+sudo docker exec "$container" sh -c '
+  chown 0:0 /data/adb/lspd/config/modules_config.db
+  chmod 600 /data/adb/lspd/config/modules_config.db
+  rm -f /data/adb/lspd/config/modules_config.db-wal
+  rm -f /data/adb/lspd/config/modules_config.db-shm
+'
+
+echo "BACKUP_DIR=$work"
+'@
+```
+
+The complete VPS was rebooted after each database repair:
+
+```powershell
+ssh -i $SshKey -o StrictHostKeyChecking=no $Remote "sudo reboot"
+```
+
+After reconnecting, the expected PairIPFix/TalsecKill logs returned and
+Target-App survived beyond its previous self-kill window.
+
+### 16.3 Prove what the submit button actually does
+
+The UI was exercised with a controlled, valid Target-App link while the capture
+tool and LSPosed logging were active. The important visual observation was:
+
+```text
+home-page link input
+  -> submit arrow accepted the URL
+  -> navigation changed to File Info
+  -> "Loading file info" remained indefinitely
+```
+
+This ruled out a touch-coordinate, URL-validation, or navigation failure.
+An initially synthetic but structurally valid link and the later authorized
+test link both reached the same loading screen. Starting the authorized link as
+an Android deep link also reproduced the stall, proving that the failure was in
+File Info initialization rather than in the home-page button:
+
+```powershell
+adb -s $AdbSerial shell am start -W `
+  -a android.intent.action.VIEW `
+  -d $TargetLink `
+  $TargetPackage
+```
+
+UI and screenshot diagnostics used these commands:
+
+```powershell
+adb -s $AdbSerial shell uiautomator dump /sdcard/target-app-ui.xml
+adb -s $AdbSerial exec-out cat /sdcard/target-app-ui.xml
+
+$Screenshot = Join-Path $env:LOCALAPPDATA "Temp\kilo\target-app-current.png"
+adb -s $AdbSerial exec-out screencap -p > $Screenshot
+```
+
+Static Hermes analysis provided the exact post-navigation chain:
+
+- API wrappers and the two file-info implementations:
+  `hermes-dec-output/decompiled_bundle.js:492121-492522`;
+- non-premium file-info route string and POST:
+  `decompiled_bundle.js:492191-492200`;
+- premium file-info route string and POST:
+  `decompiled_bundle.js:492392-492401`;
+- non-premium File Info initialization:
+  `decompiled_bundle.js:639963-640191`;
+- premium File Info initialization:
+  `decompiled_bundle.js:642500-642717`.
+
+The app-specific route strings are intentionally not copied into this guide.
+The proven generic chain is:
+
+```text
+validated Target-App link
+  -> navigate to File Info with route parameter id
+  -> Purchases.getCustomerInfo()
+  -> construct {id, t, c_i, user, s}
+  -> add dID and normalized tCfg
+  -> hash serialized body
+  -> native getCryptogram()
+  -> POST non-premium or premium file-info v3 route
+```
+
+The critical ordering detail is that `Purchases.getCustomerInfo()` is awaited
+before the body is signed. If that Promise never settles, neither
+`getCryptogram()` nor the HTTP request can run.
+
+### 16.4 Runtime evidence for the blocked Promise
+
+The stuck run produced all of the following evidence:
+
+```text
+BillingClient: Client is already in the process of connecting to billing service
+GoogleApiManager: Unknown calling package name 'com.google.android.gms'
+```
+
+At the same time:
+
+- Target-App remained alive on the File Info loading screen;
+- the initialization request still returned HTTP 200;
+- RevenueCat made an SDK request and received HTTP 304;
+- no new TalsecKill `getCryptogram()` entry followed the link submission;
+- the capture contained no file-info API call.
+
+This proved the immediate failure boundary: execution had stopped before
+AppiCrypt signing. The Billing/Google errors were consistent with the unresolved
+RevenueCat call, but the `Unknown calling package` message alone was not treated
+as proof of a signing-key, license-tester, or installer-policy failure.
+
+The safe log filters used during correlation were:
+
+```powershell
+adb -s $AdbSerial logcat -d -v threadtime `
+  -s LSPosed-Bridge:I '*:S'
+
+adb -s $AdbSerial logcat -d -v threadtime | `
+  findstr /I /C:"BillingClient" /C:"RevenueCat" `
+    /C:"Purchases" /C:"CustomerInfo" `
+    /C:"Unknown calling package"
+```
+
+Broad `ReactNativeJS` logging was deliberately avoided because Target-App's
+diagnostics can contain complete protected request bodies or token material.
+
+The installed Google components and billing service declaration were checked:
+
+```powershell
+adb -s $AdbSerial shell pm path com.android.vending
+adb -s $AdbSerial shell pm path com.google.android.gsf
+adb -s $AdbSerial shell pm path com.google.android.gms
+
+adb -s $AdbSerial shell dumpsys package com.android.vending | `
+  findstr /I /C:"versionName" /C:"versionCode" `
+    /C:"InAppBillingService" /C:"BIND" /C:"enabled="
+```
+
+The Play Store package and its `InAppBillingService` declaration existed. An
+attempt to open the Target-App Play listing reached Play Store's deep-link
+activity but did not repair the pending BillingClient connection:
+
+```powershell
+adb -s $AdbSerial shell am start -W `
+  -a android.intent.action.VIEW `
+  -d "market://details?id=$TargetPackage" `
+  com.android.vending
+```
+
+### 16.5 RevenueCat implementation findings and Internet references
+
+The app embeds RevenueCat Android SDK 9.12.0 and React Native Purchases 9.6.1.
+The preserved native call chain is:
+
+```text
+com.revenuecat.purchases.react.RNPurchasesModule.getCustomerInfo(Promise)
+  -> com.revenuecat.purchases.hybridcommon.CommonKt.getCustomerInfo(OnResult)
+  -> Purchases.getCustomerInfo(...)
+  -> PurchasesOrchestrator.getCustomerInfo(...)
+  -> CustomerInfoHelper.retrieveCustomerInfo(...)
+```
+
+Result mapping normally passes through:
+
+```text
+CustomerInfoMapperKt.map(CustomerInfo)
+  -> React Native Promise.resolve(...)
+```
+
+The following public sources were consulted:
+
+1. RevenueCat CustomerInfo caching guidance:
+   https://www.revenuecat.com/docs/customers/customer-info
+2. React Native `RNPurchasesModule.getCustomerInfo()` bridge:
+   https://github.com/RevenueCat/react-native-purchases/blob/main/android/src/main/java/com/revenuecat/purchases/react/RNPurchasesModule.java
+3. RevenueCat `CacheFetchPolicy`, including `CACHED_OR_FETCHED`:
+   https://github.com/RevenueCat/purchases-android/blob/main/purchases/src/main/kotlin/com/revenuecat/purchases/CacheFetchPolicy.kt
+4. RevenueCat CustomerInfo retrieval implementation:
+   https://github.com/RevenueCat/purchases-android/blob/main/purchases/src/main/kotlin/com/revenuecat/purchases/CustomerInfoHelper.kt
+5. Pending-purchase synchronization before an uncached fetch:
+   https://github.com/RevenueCat/purchases-android/blob/main/purchases/src/main/kotlin/com/revenuecat/purchases/PostPendingTransactionsHelper.kt
+6. RevenueCat BillingClient connection/retry handling:
+   https://github.com/RevenueCat/purchases-android/blob/main/purchases/src/main/kotlin/com/revenuecat/purchases/google/BillingWrapper.kt
+7. Google Play Billing codelab report for duplicate connection attempts:
+   https://github.com/googlecodelabs/play-billing-codelab/issues/4
+8. Google Play services architecture and setup requirements:
+   https://developers.google.com/android/guides/overview
+   https://developers.google.com/android/guides/setup
+9. Google's general Play Store and Play services troubleshooting guidance:
+   https://support.google.com/googleplay/answer/1050566
+   https://support.google.com/googleplay/answer/14121800
+
+The source review corrected an important overgeneralization: a valid cached
+CustomerInfo can resolve without waiting for a fresh billing fetch. On a cache
+miss, however, RevenueCat's path can synchronize pending purchases through
+BillingClient before fetching current CustomerInfo. A BillingClient that remains
+in `CONNECTING` can therefore leave the React Native Promise pending.
+
+No third-party Billing simulation, signature-spoofing module, FakeGApps module,
+or fabricated premium purchase was installed. Those approaches would have
+changed purchase semantics and were unnecessary for the file-information path.
+
+### 16.6 Inspect the native RevenueCat cache safely
+
+The full Target-App preference values were never printed. Only preference
+filenames, XML key names, and value lengths were inspected.
+
+Because hardened ADB could not read Target-App's private data directory, files
+were staged through container root and copied to a mode-600 VPS temporary file:
+
+```powershell
+ssh -i $SshKey -o StrictHostKeyChecking=no $Remote `
+  "sudo docker exec $Container cp /data/user/0/$TargetPackage/shared_prefs/com_revenuecat_purchases_preferences.xml /data/local/tmp/revenuecat-prefs.xml; sudo docker cp ${Container}:/data/local/tmp/revenuecat-prefs.xml /tmp/revenuecat-prefs.xml; sudo chown ubuntu:ubuntu /tmp/revenuecat-prefs.xml; chmod 600 /tmp/revenuecat-prefs.xml"
+```
+
+On the local host, the XML was parsed without printing values:
+
+```powershell
+$LocalPrefs = Join-Path $env:LOCALAPPDATA "Temp\kilo\revenuecat-prefs.xml"
+
+scp -i $SshKey -o StrictHostKeyChecking=no `
+  "${Remote}:/tmp/revenuecat-prefs.xml" `
+  $LocalPrefs
+
+$Root = [xml](Get-Content -LiteralPath $LocalPrefs -Raw)
+$Root.map.ChildNodes | ForEach-Object {
+  [pscustomobject]@{
+    Type = $_.Name
+    Key = $_.name
+    ValueLength = if ($_.value) { $_.value.Length } else { $_.'#text'.Length }
+  }
+}
+```
+
+The preferences contained RevenueCat SDK metadata such as product-entitlement
+mapping and subscriber attributes, but no complete cached `CustomerInfo` for the
+current app-user ID. The app's separate JavaScript fallback stored only a
+partial `lastKnownCustomerInfo` entitlement object, not a complete native
+CustomerInfo map.
+
+This was independently confirmed by the first diagnostic LSPosed build:
+
+```text
+[TalsecKill] RevenueCat native-cache hook installed
+[TalsecKill] RevenueCat CustomerInfo cache miss; original path retained
+```
+
+The original path then reproduced the same indefinite File Info spinner.
+
+### 16.7 Final TalsecKill implementation
+
+The fix was added to:
+
+```text
+rev-eng/mod_build/src/com/recon/talsecbypass/Hook.java
+```
+
+The hook is deliberately narrow:
+
+```text
+com.revenuecat.purchases.react.RNPurchasesModule
+  .getCustomerInfo(com.facebook.react.bridge.Promise)
+```
+
+Its behavior is:
+
+1. obtain RevenueCat's current shared `Purchases` instance;
+2. obtain the current app-user ID without logging it;
+3. read `DeviceCache.getCachedCustomerInfo(appUserId)`;
+4. when present, map the genuine cached CustomerInfo with RevenueCat's own
+   `CustomerInfoMapperKt.map()` and resolve the React Native Promise;
+5. when absent, resolve the Promise with `null` instead of leaving it pending;
+6. never create an entitlement, subscription, receipt, or premium purchase;
+7. fall back to the original method if RevenueCat's internal object graph changes
+   and the reflection hook itself throws.
+
+The relevant implementation shape is:
+
+```java
+Object customerInfo = XposedHelpers.callMethod(
+    deviceCache, "getCachedCustomerInfo", appUserId);
+
+if (customerInfo == null) {
+    XposedHelpers.callMethod(p.args[0], "resolve", (Object) null);
+    p.setResult(null);
+    XposedBridge.log(TAG
+        + "RevenueCat CustomerInfo cache miss; resolved null");
+    return;
+}
+
+Object mapped = XposedHelpers.callStaticMethod(
+    customerInfoMapper, "map", customerInfo);
+Object nativeMap = XposedHelpers.callStaticMethod(
+    argumentsClass, "makeNativeMap", mapped);
+XposedHelpers.callMethod(p.args[0], "resolve", nativeMap);
+p.setResult(null);
+```
+
+Target-App's JavaScript already treats `null` CustomerInfo as non-premium:
+`isPremiumInfo(null)` returns false and the subscription state uses empty
+entitlements. Therefore the null fallback restores existing non-premium
+behavior rather than inventing subscription state.
+
+The trade-off is explicit: if RevenueCat has no full cache, the current session
+is treated as non-premium for this call. If a valid full cache exists later, the
+same hook preserves and returns its real entitlement state.
+
+### 16.8 Build, install, scope, and reboot the fixed module
+
+The target package placeholder in `Hook.java` is replaced only in generated
+build output. The source remains app-agnostic.
+
+```powershell
+$env:TARGET_APP_PACKAGE = $TargetPackage
+& "C:\Program Files\Git\bin\bash.exe" `
+  "rev-eng/mod_build/build_module.sh"
+
+adb -s $AdbSerial install -r "rev-eng\modules\talseckill.apk"
+adb -s $AdbSerial shell pm path com.recon.talsecbypass
+```
+
+Each install generated a new randomized APK path. The writer-freeze LSPosed
+database procedure from section 16.2 was repeated with that exact path, followed
+by a complete VPS reboot and tunnel reconnection.
+
+Successful hook evidence was:
+
+```text
+[TalsecKill] loaded in <TARGET_PACKAGE>
+[TalsecKill] RevenueCat native-cache hook installed
+[TalsecKill] RevenueCat CustomerInfo cache miss; resolved null
+```
+
+The final APK was verified after rebuilding:
+
+```powershell
+& "<ANDROID_SDK>\build-tools\35.0.1\apksigner.bat" `
+  verify --verbose `
+  "rev-eng\modules\talseckill.apk"
+```
+
+Verification passed for APK signature schemes v1, v2, and v3.
+
+### 16.9 Controlled UI and network verification
+
+Before capture, stale proxy state and old runtime state were removed:
+
+```powershell
+adb -s $AdbSerial shell am force-stop $TargetPackage
+adb -s $AdbSerial logcat -c
+adb -s $AdbSerial shell settings put global http_proxy :0
+adb -s $AdbSerial shell settings delete global global_http_proxy_host
+adb -s $AdbSerial shell settings delete global global_http_proxy_port
+adb -s $AdbSerial shell settings delete global global_http_proxy_exclusion_list
+adb -s $AdbSerial shell settings delete global global_proxy_pac_url
+adb -s $AdbSerial reverse --remove tcp:8080
+```
+
+The capture was started with a generic name:
+
+```powershell
+python -u ".\rev-eng\network-tools\capture-live-networks.py" `
+  --serial $AdbSerial `
+  --name target-app-link-submit-fixed
+```
+
+Target-App was launched and the actual home-page control was used. The test
+accepted the terms dialog when it appeared, scrolled the form into view, entered
+`<TARGET_LINK>`, hid the keyboard, and pressed the submit arrow:
+
+```powershell
+adb -s $AdbSerial shell am start -W -n $TargetActivity
+Start-Sleep -Seconds 18
+
+# Accept the one-time terms dialog only when it is visible.
+adb -s $AdbSerial shell input tap <CONTINUE_X> <CONTINUE_Y>
+
+# Scroll until the link input and submit arrow are visible.
+adb -s $AdbSerial shell input swipe 360 1000 360 420 700
+adb -s $AdbSerial shell input swipe 360 1000 360 500 700
+
+adb -s $AdbSerial shell input tap <INPUT_X> <INPUT_Y>
+adb -s $AdbSerial shell input text $TargetLink
+adb -s $AdbSerial shell input keyevent 4
+adb -s $AdbSerial shell input tap <SUBMIT_X> <SUBMIT_Y>
+Start-Sleep -Seconds 30
+```
+
+UI hierarchy dumps were used only to verify the control bounds and exact input
+text. A previous failed automation attempt was explained by the on-screen
+keyboard: the nominal button coordinate hit a keyboard letter until `KEYCODE_BACK`
+hid the IME.
+
+The final secret-safe capture summary was:
+
+```text
+Target-App protected initialization       HTTP 200
+non-premium file-info v3 request          HTTP 200
+file-info request keys                    c_i, dID, id, s, t, tCfg, user
+c_i                                       null (native cache miss fallback)
+crypt header                              present
+file-info response keys                   fileInfo, uploader
+```
+
+This is the decisive proof that execution now proceeds past
+`Purchases.getCustomerInfo()`, invokes AppiCrypt signing, emits the file-info
+request, and receives a successful backend response.
+
+The corresponding private capture contained 219 records and remained protected
+by the existing Git ignore rule. During the ad-heavy portion of the run,
+`capture-live-networks.py` logged one transient Windows `PermissionError` while
+atomically replacing its JSON output file. Later flushes succeeded, and the
+final valid JSON included the complete HTTP 200 file-info record. This capture
+writer issue did not cause the original Target-App spinner and did not invalidate
+the endpoint result.
+
+### 16.10 Cleanup and final runtime state
+
+After verification, Target-App was force-stopped, all global proxy keys were
+cleared, the ADB reverse mapping was removed, UI XML files were deleted, and
+volatile logcat data was cleared. When hardened ADB was slow or unavailable,
+the equivalent root cleanup was run through the container:
+
+```powershell
+ssh -i $SshKey -o StrictHostKeyChecking=no $Remote `
+  "sudo docker exec $Container sh -c 'am force-stop <TARGET_PACKAGE>; settings put global http_proxy :0; settings delete global global_http_proxy_host; settings delete global global_http_proxy_port; settings delete global global_http_proxy_exclusion_list; settings delete global global_proxy_pac_url; rm -f /sdcard/target-app-*.xml; logcat -c'"
+```
+
+RevenueCat preference copies were removed from the device staging directory,
+VPS `/tmp`, and the local temporary directory. The capture remains private and
+Git-ignored. The Redroid container was left running with the repaired LSPosed
+scope and the working TalsecKill hook active.
+
+### 16.11 Final finding
+
+The link submission issue was a separate asynchronous dependency failure, not a
+repeat of the earlier protected-initialization 403:
+
+```text
+submit arrow
+  -> navigation succeeded
+  -> RevenueCat CustomerInfo Promise stayed pending
+  -> AppiCrypt signing never ran
+  -> file-info HTTP request never existed
+```
+
+The final fix changed that to:
+
+```text
+submit arrow
+  -> navigation succeeded
+  -> real cached CustomerInfo returned when available
+     OR null non-premium state returned on cache miss
+  -> AppiCrypt signing ran normally
+  -> non-premium file-info v3 request returned HTTP 200
+```
+
+This fix is intentionally narrower than a general Play Billing bypass. It does
+not simulate purchases, spoof a premium entitlement, replace RevenueCat, or
+disable Target-App's protected request signing.
