@@ -1,0 +1,13 @@
+[Unit]
+Description=Persist FastAPI networking and recover its ReDroid ADB transport
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/redroid-api-network
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Recover KernelSU and LSPosed after Coolify ReDroid restarts
+After=docker.service redroid-binder-permissions.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/redroid-kernelsu-replay
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

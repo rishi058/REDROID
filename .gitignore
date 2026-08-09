@@ -31,6 +31,10 @@ __pycache__
 secrets 
 certs
 03-key-findings.md
+fast-api-service
+
+# App-specific ADB worm incident scripts (not reusable deployment tooling)
+KernelSU_setup/coolify/adb-worm-incident/*.sh
 
 rev-eng/apk-extractor/hermes-dec-output/**
 !rev-eng/apk-extractor/hermes-dec-output/
@@ -60,4 +64,3 @@ rev-eng/network-tools/certs/**
 rev-eng/modules/secrets/**
 !rev-eng/modules/secrets/
 !rev-eng/modules/secrets/.gitkeep
-
