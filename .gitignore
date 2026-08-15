@@ -64,3 +64,5 @@ rev-eng/network-tools/certs/**
 rev-eng/modules/secrets/**
 !rev-eng/modules/secrets/
 !rev-eng/modules/secrets/.gitkeep
+
+DW-fast-api

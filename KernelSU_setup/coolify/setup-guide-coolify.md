@@ -224,6 +224,56 @@ networks:
 
 The service mounts the three persistent BinderFS nodes and the persistent Android data directory. It also maps `/dev/kmsg` to `/dev/null`, so Android cannot write the real host kernel log. `restart: unless-stopped` makes the Coolify-managed container return automatically after Docker or the VPS restarts; the memory and PID limits still bound a failed workload.
 
+### Display and scrcpy responsiveness
+
+On the GPU-less Ampere host, `androidboot.redroid_gpu_mode=guest` is required.
+Without explicit display arguments, this ReDroid image exposed a 720×1280 display
+at only 15 Hz (`dumpsys display` reported `renderFrameRate=15.000001`). The image
+and host were both ARM64, BinderFS devices matched by inode, 2 GiB swap was
+active, and there was no OOM event; the 15 Hz display ceiling was the primary
+source of visibly delayed UI interaction.
+
+The conservative two-core configuration is:
+
+```yaml
+command:
+  - androidboot.redroid_gpu_mode=guest
+  - androidboot.use_memfd=1
+  - androidboot.redroid_width=720
+  - androidboot.redroid_height=1280
+  - androidboot.redroid_dpi=320
+  - androidboot.redroid_fps=24
+```
+
+Keep the existing 1.5-CPU safety limit initially. During a 38-second scrcpy/UI
+interaction sample at 15 Hz, the cgroup was throttled in 26 of 384 periods and
+accumulated about 0.8 seconds of throttled time, so CPU quota pressure existed
+but was not the main bottleneck. Re-measure `cpu.stat` after enabling 24 Hz before
+raising the quota or trying 30 Hz.
+
+Disable Android animation delays once; these settings persist under `/data`:
+
+```bash
+adb shell settings put global window_animation_scale 0
+adb shell settings put global transition_animation_scale 0
+adb shell settings put global animator_duration_scale 0
+adb shell settings put global disable_window_blurs 1
+```
+
+Use H.264 and do not ask scrcpy for frames the device cannot produce:
+
+```powershell
+scrcpy -s 127.0.0.1:5555 `
+  --max-size=720 --max-fps=24 --video-bit-rate=2M `
+  --video-codec=h264 --no-audio
+```
+
+Do not use H.265 for this CPU-only path. If 24 Hz materially increases cgroup
+throttling or produces new stutter, set `androidboot.redroid_fps=20`; only test
+30 Hz after 24 Hz passes the same interaction sample. The deployed 24 Hz profile
+passed: an equivalent interaction sample was throttled in 6 of 426 periods and
+added only about 79 ms of throttled time, with no OOM or container restart.
+
 `5555:5555` publishes ADB on all VPS interfaces. It was selected so the API can
 reach Docker's published-port path. No persistent `DOCKER-USER` restriction was
 installed in this run. Keep the cloud/VPS firewall closed to untrusted TCP/5555
@@ -1036,6 +1086,49 @@ Store: the retained official Play-signed Target-App splits were installed from
 the host, followed by PairIPFix and the unchanged TalsecKill APK. Target-App's v3
 request then returned HTTP 200.
 
+### Play Store could not open its own `Phonesky.apk`
+
+**Symptom**
+
+Play Store exited during `ActivityThread.handleBindApplication()` with
+`ClassNotFoundException` and `Unable to open
+'/system/product/priv-app/Phonesky/Phonesky.apk'`. The APK existed from the
+container/root mount namespace, but it disappeared from the Play Store process.
+
+**Cause**
+
+The customized KOWX712 PIF Zygisk module calls `FORCE_DENYLIST_UNMOUNT` for
+`com.android.vending` before checking the `spoofVendingBuild` and
+`spoofVendingSdk` switches. Setting those switches to `false` therefore prevents
+property spoofing but does not prevent the denylist unmount. Because LiteGApps is
+systemless, that unmount also removes the mount containing Play Store's own APK.
+
+**Diagnosis and temporary recovery**
+
+The reviewed PIF build's built-in script-only mode keeps `post-fs-data.sh` and
+the coherent global Pixel profile, while its Zygisk code exits before requesting
+the per-process unmount:
+
+```bash
+CONTAINER=$(sudo docker ps -q --filter 'label=coolify.serviceName=redroid14')
+sudo docker exec "$CONTAINER" sh -c '
+  touch /data/adb/pif_script_only
+  chown root:root /data/adb/pif_script_only
+  chmod 600 /data/adb/pif_script_only
+'
+sudo reboot
+```
+
+After the full VPS reboot, verify that `com.android.vending` retains a PID and
+that logcat has no `Phonesky.apk`, `Resources.getConfiguration`, or fatal Play
+Store errors.
+
+Do not leave script-only mode as the final state when another protected app
+depends on PIF's GMS/DroidGuard injection. Restore the reviewed PIF configuration
+by removing `/data/adb/pif_script_only` and performing a full VPS reboot. Treat
+the marker as a bounded Play Store crash diagnostic, not as the fix for Play
+catalog eligibility or another app's integrity flow.
+
 ### Certificate existed under `/system` but TLS interception failed
 
 **Cause**
@@ -1129,6 +1222,20 @@ Anything else installed via `com.android.shell` should be treated as the worm.
 Open Play Store inside Android through `scrcpy` and enter Google credentials only in the Android UI. Do not put a password in ADB commands, shell history, scripts, logs, or this document.
 
 Play Store availability does not imply Play Protect certification or Play Integrity. If Play Protect registration is required, follow the GSF ID procedure in `KernelSU_setup/setup_guide.md` section 12.8. Keep `/home/ubuntu/redroid14-data` unchanged after registering, because recreating Android data changes the GSF ID.
+
+The on-device check is **Profile → Settings → About → Play Protect
+certification**. If it reports **Device is not certified**, first compare the
+installed `/data/adb/tricky_store/keybox.xml` by SHA-256 and permissions without
+printing it. Recopying an identical keybox does not change certification.
+TEESimulator/keybox attestation and Play Protect certification are related but
+separate states: the former can produce Basic/Device/Strong verdicts for a
+targeted checker while Play Store still reports the device as uncertified.
+
+Use **Fix device issue** once. If Google cannot repair certification, retain the
+existing GSF database, retrieve its GSF ID as documented in section 12.8, and
+submit that same ID through Google's signed-in uncertified-device portal. Do not
+clear GSF merely to retry: doing so creates another ID and invalidates the
+registration being diagnosed.
 
 ### Recovery: disable LiteGapps
 

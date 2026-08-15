@@ -33,3 +33,6 @@ ssh -i "C:/Users/Rishi/.ssh/ssh-key-2026-07-06(pvt).key" `
   -N `
   -L 127.0.0.1:5555:127.0.0.1:5555 `
   ubuntu@141.148.151.172
+
+
+scrcpy -s 127.0.0.1:5555 --max-size=720 --max-fps=24 --video-bit-rate=2M --video-codec=h264 --no-audio
