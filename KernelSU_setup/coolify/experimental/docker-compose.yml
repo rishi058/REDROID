@@ -1,0 +1,59 @@
+services:
+  redroid-experimental:
+    image: redroid/redroid@sha256:0a611199ba2e0b5d60af39b3327a517f6407231f4352114ed3bd3cbfe2be69aa
+    hostname: redroid-experimental
+    privileged: true
+    restart: unless-stopped
+    cpus: 0.5
+    mem_limit: 4g
+    memswap_limit: 5g
+    pids_limit: 4096
+    stop_grace_period: 10s
+    ports:
+      - "127.0.0.1:5557:5555"
+    networks:
+      redroid-persistent:
+        aliases:
+          - redroid-experimental
+    volumes:
+      - /dev/binderfs-experimental/binder:/dev/binder
+      - /dev/binderfs-experimental/hwbinder:/dev/hwbinder
+      - /dev/binderfs-experimental/vndbinder:/dev/vndbinder
+      - /dev/null:/dev/kmsg
+      - type: bind
+        source: /home/ubuntu/redroid-experimental-data
+        target: /data
+        bind:
+          create_host_path: true
+    logging:
+      driver: json-file
+      options:
+        max-size: 25m
+        max-file: "2"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test "$(getprop sys.boot_completed)" = 1 &&
+          test "$(getprop init.svc.adbd)" = running &&
+          pidof adbd >/dev/null
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 10m
+    command:
+      - androidboot.redroid_gpu_mode=guest
+      - androidboot.use_memfd=1
+      - androidboot.redroid_width=720
+      - androidboot.redroid_height=1280
+      - androidboot.redroid_dpi=320
+      - androidboot.redroid_fps=15
+      - net.hostname=redroid-experimental
+      - service.adb.tcp.port=5555
+      - ro.secure=0
+      - ro.debuggable=1
+
+networks:
+  redroid-persistent:
+    external: true
+    name: redroid-persistent

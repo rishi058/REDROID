@@ -1,0 +1,1 @@
+Reminder on the two standing operating rules while two rooted instances run: keep the KernelSU su allowlist empty, and manage modules per-instance via the ksud CLI rather than the Manager GUI.

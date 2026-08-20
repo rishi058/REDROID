@@ -1,0 +1,154 @@
+diff --git a/drivers/android/Kconfig b/drivers/android/Kconfig
+index 07aa8ae0a..fe5287e35 100644
+--- a/drivers/android/Kconfig
++++ b/drivers/android/Kconfig
+@@ -2,7 +2,7 @@
+ menu "Android"
+ 
+ config ANDROID_BINDER_IPC
+-	bool "Android Binder IPC Driver"
++	tristate "Android Binder IPC Driver"
+ 	depends on MMU
+ 	default n
+ 	help
+@@ -14,8 +14,8 @@ config ANDROID_BINDER_IPC
+ 	  between said processes.
+ 
+ config ANDROID_BINDERFS
+-	bool "Android Binderfs filesystem"
+-	depends on ANDROID_BINDER_IPC
++	tristate "Android Binderfs filesystem"
++	depends on (ANDROID_BINDER_IPC=y) || (ANDROID_BINDER_IPC=m && m)
+ 	default n
+ 	help
+ 	  Binderfs is a pseudo-filesystem for the Android Binder IPC driver
+diff --git a/drivers/android/Makefile b/drivers/android/Makefile
+index c9d3d0c99..8b91b88fc 100644
+--- a/drivers/android/Makefile
++++ b/drivers/android/Makefile
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ ccflags-y += -I$(src)			# needed for trace events
+ 
+-obj-$(CONFIG_ANDROID_BINDERFS)		+= binderfs.o
+-obj-$(CONFIG_ANDROID_BINDER_IPC)	+= binder.o binder_alloc.o
+-obj-$(CONFIG_ANDROID_BINDER_IPC_SELFTEST) += binder_alloc_selftest.o
++binder_linux-y := binder.o binder_alloc.o
++obj-$(CONFIG_ANDROID_BINDER_IPC) += binder_linux.o
++binder_linux-$(CONFIG_ANDROID_BINDERFS) += binderfs.o
++binder_linux-$(CONFIG_ANDROID_BINDER_IPC_SELFTEST) += binder_alloc_selftest.o
+diff --git a/drivers/android/binder.c b/drivers/android/binder.c
+index e029687e5..61b6c4bc9 100644
+--- a/drivers/android/binder.c
++++ b/drivers/android/binder.c
+@@ -6633,9 +6633,20 @@ static int __init binder_init(void)
+ 	return ret;
+ }
+ 
+-device_initcall(binder_init);
++module_init(binder_init);
++/*
++ * binder will have no exit function since binderfs instances can be mounted
++ * multiple times and also in user namespaces finding and destroying them all
++ * is not feasible without introducing insane locking. Just ignoring existing
++ * instances on module unload also wouldn't work since we would loose track of
++ * what major numer was dynamically allocated and also what minor numbers are
++ * already given out. So this would get us into all kinds of issues with device
++ * number reuse. So simply don't allow unloading unless we are forced to do so.
++ */
++
++MODULE_AUTHOR("Google, Inc.");
++MODULE_DESCRIPTION("Driver for Android binder device");
++MODULE_LICENSE("GPL v2");
+ 
+ #define CREATE_TRACE_POINTS
+ #include "binder_trace.h"
+-
+-MODULE_LICENSE("GPL v2");
+diff --git a/drivers/android/binder_alloc.c b/drivers/android/binder_alloc.c
+index e0e4dc38b..4975e01be 100644
+--- a/drivers/android/binder_alloc.c
++++ b/drivers/android/binder_alloc.c
+@@ -38,8 +38,7 @@ enum {
+ };
+ static uint32_t binder_alloc_debug_mask = BINDER_DEBUG_USER_ERROR;
+ 
+-module_param_named(debug_mask, binder_alloc_debug_mask,
+-		   uint, 0644);
++module_param_named(alloc_debug_mask, binder_alloc_debug_mask, uint, 0644);
+ 
+ #define binder_alloc_debug(mask, x...) \
+ 	do { \
+diff --git a/drivers/android/binder_alloc.h b/drivers/android/binder_alloc.h
+index 703872344..a0087ab1f 100644
+--- a/drivers/android/binder_alloc.h
++++ b/drivers/android/binder_alloc.h
+@@ -6,6 +6,7 @@
+ #ifndef _LINUX_BINDER_ALLOC_H
+ #define _LINUX_BINDER_ALLOC_H
+ 
++#include <linux/kconfig.h>
+ #include <linux/rbtree.h>
+ #include <linux/list.h>
+ #include <linux/mm.h>
+@@ -111,7 +112,7 @@ struct binder_alloc {
+ 	bool oneway_spam_detected;
+ };
+ 
+-#ifdef CONFIG_ANDROID_BINDER_IPC_SELFTEST
++#if IS_ENABLED(CONFIG_ANDROID_BINDER_IPC_SELFTEST)
+ void binder_selftest_alloc(struct binder_alloc *alloc);
+ #else
+ static inline void binder_selftest_alloc(struct binder_alloc *alloc) {}
+diff --git a/drivers/android/binder_internal.h b/drivers/android/binder_internal.h
+index 5b7c80b99..6a1b00271 100644
+--- a/drivers/android/binder_internal.h
++++ b/drivers/android/binder_internal.h
+@@ -5,6 +5,7 @@
+ 
+ #include <linux/export.h>
+ #include <linux/fs.h>
++#include <linux/kconfig.h>
+ #include <linux/list.h>
+ #include <linux/miscdevice.h>
+ #include <linux/mutex.h>
+@@ -77,7 +78,7 @@ extern const struct file_operations binder_fops;
+ 
+ extern char *binder_devices_param;
+ 
+-#ifdef CONFIG_ANDROID_BINDERFS
++#if IS_ENABLED(CONFIG_ANDROID_BINDERFS)
+ extern bool is_binderfs_device(const struct inode *inode);
+ extern struct dentry *binderfs_create_file(struct dentry *dir, const char *name,
+ 					   const struct file_operations *fops,
+@@ -98,7 +99,7 @@ static inline struct dentry *binderfs_create_file(struct dentry *dir,
+ static inline void binderfs_remove_file(struct dentry *dentry) {}
+ #endif
+ 
+-#ifdef CONFIG_ANDROID_BINDERFS
++#if IS_ENABLED(CONFIG_ANDROID_BINDERFS)
+ extern int __init init_binderfs(void);
+ #else
+ static inline int __init init_binderfs(void)
+diff --git a/drivers/android/binderfs.c b/drivers/android/binderfs.c
+index 3001d754a..c817d64f8 100644
+--- a/drivers/android/binderfs.c
++++ b/drivers/android/binderfs.c
+@@ -120,7 +120,7 @@ static int binderfs_binder_device_create(struct inode *ref_inode,
+ 	struct super_block *sb = ref_inode->i_sb;
+ 	struct binderfs_info *info = sb->s_fs_info;
+ #if defined(CONFIG_IPC_NS)
+-	bool use_reserve = (info->ipc_ns == &init_ipc_ns);
++	bool use_reserve = (info->ipc_ns == show_init_ipc_ns());
+ #else
+ 	bool use_reserve = true;
+ #endif
+@@ -397,7 +397,7 @@ static int binderfs_binder_ctl_create(struct super_block *sb)
+ 	struct dentry *root = sb->s_root;
+ 	struct binderfs_info *info = sb->s_fs_info;
+ #if defined(CONFIG_IPC_NS)
+-	bool use_reserve = (info->ipc_ns == &init_ipc_ns);
++	bool use_reserve = (info->ipc_ns == show_init_ipc_ns());
+ #else
+ 	bool use_reserve = true;
+ #endif

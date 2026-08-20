@@ -7,7 +7,6 @@ set -u
 
 APPLICATION_ID=14
 NETWORK=redroid-persistent
-ADB_GATEWAY=172.29.14.1
 ADB_SERIAL=redroid14:5555
 HEALTH_INTERVAL=30
 OFFLINE_THRESHOLD=2
@@ -70,7 +69,7 @@ connect_api_transport() {
 }
 
 ensure_container_network() {
-  local container=$1
+  local container=$1 redroid redroid_ip
 
   if ! docker inspect "$container" \
       --format '{{json .NetworkSettings.Networks}}' | grep -q '"redroid-persistent"'; then
@@ -80,11 +79,18 @@ ensure_container_network() {
     log "API container $container is already attached to $NETWORK"
   fi
 
+  redroid=$(docker ps -q --filter 'label=coolify.serviceName=redroid14' | head -n 1)
+  [ -n "$redroid" ] || return 1
+  redroid_ip=$(docker inspect "$redroid" --format \
+    '{{with index .NetworkSettings.Networks "redroid-persistent"}}{{.IPAddress}}{{end}}')
+  [ -n "$redroid_ip" ] || return 1
+
   if ! docker exec "$container" grep -qE \
-      "^${ADB_GATEWAY}[[:space:]]+redroid14([[:space:]]|$)" /etc/hosts; then
+      "^${redroid_ip}[[:space:]]+redroid14([[:space:]]|$)" /etc/hosts; then
     docker exec "$container" sh -c \
-      "echo '${ADB_GATEWAY} redroid14 redroid14-ksu' >> /etc/hosts" || return 1
-    log "Mapped redroid14 to the persistent ADB gateway $ADB_GATEWAY"
+      "awk '!/(^|[[:space:]])redroid14([[:space:]]|$)/' /etc/hosts > /tmp/hosts.redroid && cat /tmp/hosts.redroid > /etc/hosts && rm -f /tmp/hosts.redroid && echo '${redroid_ip} redroid14 redroid14-ksu' >> /etc/hosts" \
+      || return 1
+    log "Mapped redroid14 to production container $redroid_ip on $NETWORK"
   fi
 }
 
@@ -147,6 +153,11 @@ while sleep 5; do
   now=$(date +%s)
   [ $((now - last_health)) -ge "$HEALTH_INTERVAL" ] || continue
   last_health=$now
+
+  if ! ensure_container_network "$container"; then
+    log "Failed to refresh production ReDroid network identity"
+    continue
+  fi
 
   state=$(adb_state "$container")
   if [ "$state" = device ]; then

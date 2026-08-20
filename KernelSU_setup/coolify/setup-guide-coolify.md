@@ -72,7 +72,7 @@ All files are in `KernelSU_setup/coolify/`:
 | `mitmproxy-ca-post-fs-data.sh` | Rebuilds Android 14's active Conscrypt APEX CA view with the local capture CA. |
 | `redroid-kernelsu-replay.sh` | Detects loss of LSPosed after a Coolify restart and schedules one guarded host reboot. |
 | `redroid-kernelsu-replay.service` | Keeps the guarded recovery watcher active on the VPS. |
-| `redroid-api-network.sh` | Reattaches recreated FastAPI containers, restores the stable ADB gateway alias, and calls `/adb/connect`. |
+| `redroid-api-network.sh` | Reattaches recreated FastAPI containers, refreshes the production ReDroid network mapping, and calls `/adb/connect`. |
 | `redroid-api-network.service` | Keeps API networking and its ADB transport healthy without restarting ReDroid. |
 
 ## 1. Upload the deployment bundle
@@ -168,9 +168,8 @@ flowchart LR
     Operator[Operator via Coolify] --> Compose[Coolify Compose service]
     Compose --> Android[ReDroid Android container]
     Android --> Data[(Persistent /data bind mount)]
-    API[FastAPI service] --> Gateway[172.29.14.1:5555]
-    Gateway --> Published[Docker published ADB port]
-    Published --> Android
+    API[FastAPI service] --> Direct[Production ReDroid IP :5555]
+    Direct --> Android
     Network[(redroid-persistent\n172.29.14.0/24)] --- Compose
     Network --- API
     Firewall[DOCKER-USER firewall] -. protects .-> Published
@@ -304,10 +303,11 @@ Docker's generated container name and IP address can change. Android init resets
 `localhost`; the guarded host service reapplies `redroid14-ksu` after every
 successful Android boot.
 
-The VPS resolves Docker DNS aliases for ReDroid, but direct API-container traffic
-to the ReDroid container IP is blocked. FastAPI therefore keeps the requested
-serial `redroid14:5555` while mapping `redroid14` to the fixed external-network
-gateway `172.29.14.1`, where the published port is reachable.
+FastAPI keeps the requested serial `redroid14:5555`. The host watcher resolves
+only the production `coolify.serviceName=redroid14` endpoint on
+`redroid-persistent` and refreshes that name inside the API container. This
+bypasses the published-port hairpin path, which returned `No route to host`
+after a VPS reboot.
 
 Verification:
 
@@ -343,9 +343,6 @@ services:
       redroid-persistent:
         aliases:
           - dw-fast-api
-    extra_hosts:
-      - "redroid14:172.29.14.1"
-
 networks:
   redroid-persistent:
     external: true
@@ -377,7 +374,8 @@ sudo systemctl enable --now redroid-api-network.service
 For each new API container ID/start timestamp, the watcher:
 
 1. attaches it to `redroid-persistent` if required;
-2. maps `redroid14` to `172.29.14.1` in that container's `/etc/hosts`;
+2. resolves the production ReDroid IP on `redroid-persistent` and maps
+   `redroid14` to that current address in the API container's `/etc/hosts`;
 3. waits for FastAPI port `8001`;
 4. calls the retry-safe internal `POST /adb/connect` route with the configured
    admin key when required;
@@ -393,7 +391,7 @@ container automatically rejoined the network and reported:
 
 ```text
 DEFAULT_ADB_SERIAL=redroid14:5555
-TCP peer=172.29.14.1:5555
+TCP peer=<production-redroid-persistent-IP>:5555
 ADB state=device
 /adb/status online=true
 /health status=ok, adb_ready=true
@@ -995,6 +993,68 @@ The root cause was therefore not missing APKs, stale APK paths, or missing scope
 rows. Those were all correct. The cause was the absent `lspd` process after an
 unsupported container-only KernelSU recovery attempt.
 
+### Production ADB became unreachable after the experimental-host reboot
+
+**Incident boundary (2026-08-19):** `redroid14` is production;
+`redroid-experimental` is a separate Coolify service. The production Android
+container itself did not fail during this incident. It was boot-complete and
+Docker-healthy, `adbd` and `lspd` were running, GSF and the Conscrypt CA were
+present, and the guarded KernelSU watcher reported the production stack healthy.
+The failure was the network path used to reach production ADB.
+
+**Symptoms**
+
+```text
+DW-fast-api /health: status=degraded, adb_ready=false
+adb connect redroid14:5555: No route to host
+pending capture queue: full
+Windows adb through 127.0.0.1:5555: offline
+```
+
+The old API mapping sent `redroid14:5555` to the persistent-network gateway
+`172.29.14.1:5555`, relying on Docker's published-port hairpin path. After the
+VPS reboot, Docker forwarded that port toward ReDroid's Coolify-network address,
+but traffic originating from `redroid-persistent` could not complete that
+cross-network path. FastAPI then exhausted the primary transport, probed the
+non-listening `:5554` fallback, closed recovery admission, and filled its bounded
+pending queue. The Windows tunnel had the same problem because it targeted the
+host's published `127.0.0.1:5555` path.
+
+The decisive check from inside FastAPI was:
+
+```text
+172.29.14.1:5555                         No route to host
+production redroid14 network IP:5555    connected
+```
+
+**Fix applied without restarting production ReDroid**
+
+1. Updated `redroid-api-network.sh` to resolve only the container carrying
+   `coolify.serviceName=redroid14` and obtain its current IP on
+   `redroid-persistent`.
+2. Replaced the stale gateway entry in FastAPI's `/etc/hosts` with that
+   production IP while retaining the application serial `redroid14:5555`.
+3. Restarted only FastAPI to clear the stuck recovery generation and full
+   pending queue; production ReDroid was not restarted.
+4. Reconnected Windows through an SSH tunnel whose remote target is the resolved
+   production ReDroid IP rather than the broken host-published port.
+
+Final validation:
+
+```text
+DW-fast-api /health: status=ok, adb_ready=true, adb_transport_online=true
+pending_captures=0, recovery_pending=false
+redroid14:5555 device
+Windows 127.0.0.1:5555 device
+production Diskwala PID present
+all health-enabled Docker containers healthy
+```
+
+The watcher refreshes the mapping every health interval, so a future production
+container IP change is repaired automatically. Never resolve or substitute the
+`redroid-experimental` address for `redroid14`; the Coolify service label is the
+production/experimental safety boundary.
+
 ### ADB became offline: `com.hagaseca.thost9` ADB worm (TCP/5555 hijack)
 
 **Confirmed root cause: internet-exposed ADB.** ReDroid's ADB port was published
@@ -1150,15 +1210,20 @@ The installer printed this message twice but completed successfully. The staged 
 
 ### Connect ADB from Windows
 
-Keep this tunnel open:
+Resolve the production ReDroid IP, then keep this tunnel open. Repeat this after
+a production container recreation because the IP can change:
 
 ```powershell
-ssh -i 'C:/path/to/private-key.key' `
+$Key = 'C:/path/to/private-key.key'
+$Target = 'ubuntu@SERVER_IP'
+$RedroidIP = (ssh -i $Key $Target `
+  'c=$(sudo docker ps -q --filter label=coolify.serviceName=redroid14 | head -n1); sudo docker inspect --format ''{{with index .NetworkSettings.Networks "redroid-persistent"}}{{.IPAddress}}{{end}}'' "$c"').Trim()
+
+ssh -i $Key $Target `
   -o ExitOnForwardFailure=yes `
   -o ServerAliveInterval=30 `
   -N `
-  -L 127.0.0.1:5555:127.0.0.1:5555 `
-  ubuntu@SERVER_IP
+  -L "127.0.0.1:5555:${RedroidIP}:5555"
 ```
 
 Then, in another PowerShell window:

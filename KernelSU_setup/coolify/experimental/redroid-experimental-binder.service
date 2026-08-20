@@ -1,0 +1,13 @@
+[Unit]
+Description=Private BinderFS devices for experimental ReDroid
+After=systemd-modules-load.service dev-binderfs.mount
+Requires=systemd-modules-load.service dev-binderfs.mount
+Before=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/prepare-redroid-experimental-binder
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

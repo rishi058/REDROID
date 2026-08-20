@@ -14,8 +14,10 @@ id_ed25519*
 **/logs/
 *.log
 *.img
+*.deb
 *.tar
 *.tar.gz
+KernelSU_setup/artifacts/kernel-build/packages-*/
 
 # OS and editor files
 .DS_Store
