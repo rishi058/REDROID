@@ -145,6 +145,10 @@ bash /mnt/d/PROJECT/_TRASH/REDROID/local-setup/start-redroid14-wsl.sh
 | [docker-compose.redroid14.yml](docker-compose.redroid14.yml) | Defines the `redroid14` container: image, privileged mode, port `5555`, `/data` volume, BinderFS bind. |
 | [start-redroid14-wsl.sh](start-redroid14-wsl.sh) | Preflight + launcher. Refuses to start ReDroid unless Docker is up and the running kernel exposes BinderFS, then mounts BinderFS and `docker compose up -d`. |
 | [build-ksud-x86_64.ps1](build-ksud-x86_64.ps1) | Builds the **x86_64 Android `ksud`** from the local KernelSU source, under `local-setup/build/`, and stores the binary in `local-setup/artifacts/`. |
+| [install-litegapps-x86_64.sh](install-litegapps-x86_64.sh) | Two-pass LiteGApps (Play Store) installer for this x86_64 ReDroid: `metamodule` (Magic Mount) pass, then `litegapps` pass. Downloads cache in `artifacts/gapps/`. **Superseded by MindTheGapps** (its `customize.sh` rejects x86_64 — see 11.2). |
+| [install-mindthegapps-x86_64.sh](install-mindthegapps-x86_64.sh) | **Working GApps path.** Downloads MindTheGapps x86_64 (A14), repackages its plain `system/` tree as a Magic Mount module, and installs it. No arch-gating installer. |
+| [install-integrity-stack.sh](install-integrity-stack.sh) | Play-Integrity / genuine-device stack: `fetch` (download+verify+arch-probe), `identity-trickystore` (Pixel 5 identity module + TrickyStore + keybox), `teesimulator` (refuses on x86_64 — see 11.4). |
+| [verify-redroid-stack.sh](verify-redroid-stack.sh) | Post-restart check: waits for `sys.boot_completed`, then reports Zygisk/LSPosed/TrickyStore persistence, the Pixel 5 identity props, the `mindthegapps` mount, and GApps packages. |
 | [GUIDE.md](GUIDE.md) | Short operator cheat-sheet for connecting ADB/scrcpy and current root-stack status. |
 | `kernels/` | Exported `bzImage-*` kernel artifacts and `latest-wsl-kernel.env` metadata. |
 | `artifacts/` | Built Android binaries (e.g. `ksud-x86_64-linux-android` + `.sha256`). |
@@ -321,7 +325,7 @@ setup means a **WSL restart** (the WSL equivalent of a host reboot).
    `/data/adb/modules_update/` into `/data/adb/modules/`.
 7. LiteGApps (optional): two-pass — Magic Mount metamodule, restart, then the
    **x86_64** LiteGApps zip; remount `/dev` to `size=768M` first (default 64 MiB
-   tmpfs is too small for the ~300 MiB payload).
+   tmpfs is too small for the ~300 MiB payload). See section 11.
 
 ---
 
@@ -369,6 +373,9 @@ Verified after booting the KernelSU kernel:
   migrated into `/data/adb/modules/*/bin` (markers consumed).
 - Kernel: `CONFIG_KSU=y`, version 33223, `CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y`,
   `CONFIG_KALLSYMS_ALL=y`, BinderFS + SELinux.
+- **Google Play Store working** via MindTheGapps over Magic Mount (`com.android.vending`,
+  `com.google.android.gms`, `com.google.android.gsf`) — see section 11.3.
+- Activation is **reboot-persistent** with zero manual steps — see section 11.1.
 
 **Blockers solved (full chain):**
 
@@ -388,5 +395,172 @@ Verified after booting the KernelSU kernel:
 
 Debug builds: pass `KSU_DEBUG=1` to `build-wsl-kernelsu-redroid-kernel.sh` to get
 verbose KernelSU boot logs (`sys_call_table=0x...`, `dispatcher installed`).
+
+---
+
+## 11. Reboot persistence & LiteGApps
+
+### 11.1 Persistence — VERIFIED
+
+The Zygisk Next + LSPosed activation is **reboot-persistent** with no manual steps.
+Everything the activation depends on survives a `wsl --shutdown`:
+
+- **Kernel** — pinned in `C:\Users\Rishi\.wslconfig` (`-redroid-ksu`, with
+  `CONFIG_KALLSYMS_ALL` so the x86 dispatcher re-resolves `sys_call_table` every
+  boot and the execve hooks fire).
+- **`ksud` + modules** — live in the `redroid14-data` Docker volume mounted at
+  `/data` (`/data/adb/ksud`, `/data/adb/modules/*`), so they persist across
+  container recreation.
+- **BinderFS** — `redroid-binderfs.service` mounts it (`max=1048576`) **before**
+  `docker.service`, so the container always finds Binder at boot.
+- **Container autostart** — `redroid14` runs `restart: unless-stopped`.
+
+Verified: after `wsl --shutdown` + restart, with zero manual intervention,
+`sys.boot_completed=1` and the daemons are already running:
+
+```text
+lspd
+zn-nsdaemon-zygote  /  zn-nsdaemon-zygote_secondary
+zn-zygisk-companion64 zygisk_lsposed  /  zn-zygisk-companion32 zygisk_lsposed
+```
+
+Re-check any time from Windows:
+
+```powershell
+wsl -d Ubuntu -- bash -lc 'docker exec redroid14 sh -c "ps -A | grep -iE zygisk\|lspd"'
+wsl -d Ubuntu -- bash -lc 'docker exec redroid14 su -c id'   # expect uid=0(root)
+```
+
+### 11.2 LiteGApps (Play Store) — metamodule active, payload BLOCKED
+
+Run the two passes from Windows (each `_STAGED` message is followed by a WSL
+restart to activate):
+
+```powershell
+wsl -d Ubuntu -- bash -lc 'bash /mnt/d/PROJECT/_TRASH/REDROID/local-setup/install-litegapps-x86_64.sh metamodule'
+wsl --shutdown   # then restart docker + redroid14
+wsl -d Ubuntu -- bash -lc 'bash /mnt/d/PROJECT/_TRASH/REDROID/local-setup/install-litegapps-x86_64.sh litegapps'
+```
+
+- **Pass 1 (metamodule) — DONE.** `meta-mm` Magic Mount installs with the x86_64
+  binary (`mm_amd64`), `metamodule=1`, and after a WSL restart
+  `ksud module metamodule` reports `Installed`. This is the mount backend
+  LiteGApps needs (ReDroid's `/system` is read-only; Magic Mount overlays it).
+
+- **Pass 2 (LiteGApps zip) — BLOCKED.** The x86_64 SDK-34 lite zip
+  (`LiteGapps-x86_64-14.0-20241029-official.zip`) downloads and passes `unzip -t`,
+  but its `customize.sh` aborts inside `ksud module install` with:
+
+  ```text
+  known error •> <x64> Your Architecture Not Support
+  can't create /sdcard/Android/litegapps/log/litegapps.log: nonexistent directory
+  ```
+
+  Two independent causes:
+  1. **Arch gate** — the installer's `ARCH` probe (`getprop ro.product.cpu.abi` /
+     `uname -m`) does not classify ReDroid's `x86_64` as supported and hard-exits
+     with `<x64> Your Architecture Not Support`.
+  2. **No `/sdcard`** — during `ksud module install` the emulated storage / FUSE
+     `/sdcard` is not mounted, so the installer's logging path does not exist.
+
+  Net: LiteGApps' installer script is not ReDroid-x86_64-friendly. **Resolved by
+  switching to MindTheGapps (11.3), which ships a plain `system/` tree with no
+  installer script.**
+
+### 11.3 MindTheGapps (Play Store) via Magic Mount — WORKING
+
+The simple, container-friendly path. MindTheGapps' zip payload is a plain
+top-level `system/` tree (no arch-detecting `customize.sh`), so it drops straight
+onto Magic Mount. `install-mindthegapps-x86_64.sh` downloads the x86_64 A14 build
+(`MindTheGapps-14.0.0-x86_64-20240226.zip`, md5 `a827a84ccb0cf5914756e8561257ed13`,
+from `s1204IT/MindTheGappsBuilder`), repackages `system/` + a `module.prop` into a
+KernelSU module, and installs it. Requires the Magic Mount metamodule from 11.2
+to be active first.
+
+```powershell
+wsl -d Ubuntu -- bash /mnt/d/PROJECT/_TRASH/REDROID/local-setup/install-mindthegapps-x86_64.sh
+wsl --shutdown   # then restart docker + redroid14
+wsl -d Ubuntu -- bash /mnt/d/PROJECT/_TRASH/REDROID/local-setup/verify-redroid-stack.sh
+```
+
+Verified after the restart — Magic Mount overlays the GApps
+(`KSU on /system/system_ext/priv-app type tmpfs`, `.../etc/permissions`) and the
+packages are present:
+
+```text
+package:com.android.vending                 # Play Store
+package:com.google.android.gms              # Play Services
+package:com.google.android.gsf              # Services Framework
+package:com.google.android.googlequicksearchbox
+```
+
+Notes:
+- Payload includes `Phonesky` (Play Store), `GmsCore`, `GoogleServicesFramework`,
+  `Velvet`, `SetupWizard`, permission XMLs — lands under `/system/product` and
+  `/system/system_ext`.
+- Play Protect certification: sign in, then register the device's `android_id` at
+  <https://www.google.com/android/uncertified/> if apps flag “not certified”.
+This README is updated after each step and each blocker+solution.
+
+### 11.4 Genuine device identity + Play Integrity (Pixel 5 + TrickyStore)
+
+Goal: present a coherent Pixel 5 (redfin) Android 14 device and pass Play
+Integrity so apps install/run normally. Driven by
+[install-integrity-stack.sh](install-integrity-stack.sh); mirrors
+`rev-eng/docs/05-Follow-Up-Fixes.md` (ARM64) but adapted for x86_64.
+
+First extract the GSF ID to register the device for Play certification:
+
+```powershell
+wsl -d Ubuntu -- bash -lc 'docker cp redroid14:/data/data/com.google.android.gsf/databases/gservices.db /tmp/g.db; python3 -c "import sqlite3;print(next(v for n,v in sqlite3.connect(\"/tmp/g.db\").execute(\"select name,value from main where name=\x27android_id\x27\")))"'
+```
+
+Register the printed decimal at <https://www.google.com/android/uncertified/>
+(clearing GSF data generates a NEW id that must be re-registered).
+
+Install the Pixel 5 identity module + TrickyStore + keybox, then restart:
+
+```powershell
+wsl -d Ubuntu -- bash /mnt/d/PROJECT/_TRASH/REDROID/local-setup/install-integrity-stack.sh identity-trickystore
+wsl --shutdown   # restart docker + redroid14
+wsl -d Ubuntu -- bash /mnt/d/PROJECT/_TRASH/REDROID/local-setup/verify-redroid-stack.sh
+```
+
+- **Pixel 5 identity — DONE.** A generated KernelSU module `redroid_pixel5`
+  (`system.prop`) resetprops the redfin profile on every boot. Verified:
+  `ro.product.model=Pixel 5`, `manufacturer=Google`, `device=redfin`,
+  `brand=google`, `ro.build.fingerprint=google/redfin/redfin:14/UP1A.231105.001.B2/...:user/release-keys`,
+  `verifiedbootstate=green`, `flash.locked=1`. Top-level **and** per-partition
+  (`ro.product.<system|vendor|product|odm|system_ext>.*`) keys are set so every
+  getter agrees.
+  - **ADB side effect:** the module also sets `ro.secure=1` + `ro.debuggable=0`
+    (genuine-device values), which switches adbd to **authenticated** mode, so
+    `adb connect` starts returning `failed to authenticate`. Fix (keeps the
+    genuine props): trust the host key once — the script does this automatically
+    (`authorize_adb`), or run it standalone:
+    `install-integrity-stack.sh authorize-adb`. It writes
+    `~/.android/adbkey.pub` into the container's `/data/misc/adb/adb_keys`
+    (persists in the `/data` volume) and restarts adbd. Set `ADBKEY_PUB=` to
+    override the key path.
+- **TrickyStore — DONE (x86_64).** Tricky Store v1.4.1 ships `lib/x64/libtricky_store.so`
+  + `machikado.x64`; its daemon runs. Config in `/data/adb/tricky_store/`:
+  `keybox.xml` (0600, sha256 `5c9ba17b…` — the same keybox as the docs),
+  `target.txt` (`com.android.vending`, `com.google.android.gms!`,
+  `gr.nikolasspyr.integritycheck`), `security_patch.txt`.
+- **TEESimulator-RS — BLOCKED on x86_64.** v6.0.1-282 ships `lib/x86_64/` for
+  `libTEESimulator/libinject/libsupervisor` but **`libcertgen.so` only for
+  `arm64-v8a`** — the native keybox→attestation forger has no x86_64 build, so its
+  forge path cannot run here. The docs used it for STRONG on ARM64; on x86_64 the
+  script's `teesimulator` step refuses. TrickyStore is the x86_64-viable attestor.
+- **PlayIntegrityFix (KOWX712) — not used.** Its Zygisk `.so` is arm64/armeabi
+  only (no x86_64), so the Java-layer spoof can't inject; the Pixel 5 identity is
+  instead handled by the arch-independent `redroid_pixel5` `system.prop` module.
+
+Verify integrity from inside ReDroid (needs a signed-in Google account):
+install **Play Integrity API Checker** (`gr.nikolasspyr.integritycheck`) from
+Play Store and run it. Expected on this x86_64 stack: **BASIC** and **DEVICE**
+likely pass; **STRONG** depends on the keybox being valid/unrevoked — the public
+`5c9ba17b…` keybox is almost certainly on Google's CRL, and without an x86_64
+TEESimulator there is no forge fallback, so STRONG is not expected to pass here.
 
 This README is updated after each step and each blocker+solution.

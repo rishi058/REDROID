@@ -67,5 +67,13 @@ rev-eng/modules/secrets/**
 !rev-eng/modules/secrets/
 !rev-eng/modules/secrets/.gitkeep
 
+local-setup/keybox/**
+!local-setup/keybox/
+!local-setup/keybox/.gitkeep
+
+win-kernelSU-setup/artifacts/gapps/*.zip
+local-setup/artifacts/gapps/*.zip
+
+flezen 
 DW-fast-api
 rev-eng-flezen
