@@ -1,5 +1,5 @@
 [Unit]
-Description=Recover KernelSU and LSPosed after Coolify ReDroid restarts
+Description=Recover KernelSU and LSPosed after Coolify ReDroid service restarts
 After=docker.service redroid-binder-permissions.service
 Requires=docker.service
 

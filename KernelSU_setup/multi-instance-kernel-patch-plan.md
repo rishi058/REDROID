@@ -1724,6 +1724,21 @@ If the new kernel fails before SSH starts, use the Oracle serial console. Becaus
 the selection was one-time, another reboot should normally return to the saved
 known-good entry, but console and boot-volume recovery must still be available.
 
+## Known kernel limitation: iptables `REDIRECT` target missing
+
+The `6.8.12-zksu` and `6.8.12-zksu-multi` kernels do **not** include the `xt_REDIRECT` netfilter extension (`CONFIG_NETFILTER_XT_TARGET_REDIRECT`). This was present in stock Ubuntu/Oracle kernels but was not carried into the KernelSU-patched builds.
+
+**Impact:** `iptables -j REDIRECT` (used for transparent mitmproxy setups that capture Redroid container traffic) fails with `No chain/target/match by that name`. The `DNAT` target is available as a workaround, but it is not identical in semantics (`SO_ORIGINAL_DST` behaviour differs under some configurations).
+
+**Fix:** Add to `.config` before building `6.8.12-zksu-multi`:
+```
+CONFIG_NETFILTER_XT_TARGET_REDIRECT=m
+```
+
+If the next kernel iteration needs transparent proxy for Redroid container network capture (Flezen reverse-engineering, mitmproxy), include this option. It is in `net/netfilter/Kconfig`, under `Netfilter xtables targets`.
+
+---
+
 ## Phase 12: post-boot validation
 
 After SSH returns:

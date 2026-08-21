@@ -17,9 +17,14 @@
 # Copyright (C) 2021 LSPosed Contributors
 #
 
-MODDIR=${0%/*}
+MODDIR=$(dirname "$0")
 
 cd "$MODDIR"
 
 # To avoid delaying the normal mount timing of zygote, we start LSPosed service daemon in late_start service mode instead of post-fs-data mode
-unshare --propagation slave -m sh -c "$MODDIR/daemon --system-server-max-retry=3 $@&"
+UNSHARE=/data/adb/ksu/bin/busybox
+if [ -x "$UNSHARE" ]; then
+	"$UNSHARE" unshare --propagation slave -m sh -c "$MODDIR/daemon --system-server-max-retry=3 $@&"
+else
+	"$MODDIR/daemon" --system-server-max-retry=3 "$@" &
+fi

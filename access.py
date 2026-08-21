@@ -2,6 +2,12 @@
 
 # THE USER CAN NOW MONITOR THE SCRIPTS AND ALLOWS/DENIES AI AGENT : MIDDLEWARE FOR AUTO MODE
 # USE THIS SCRIPT FOR EXECUTING COMMANDS
+#
+# Usage:
+#   python access.py [--quiet] <command> [args...]
+#
+# --quiet / -q : suppress the banner and Exit Code lines so output can be
+#   parsed directly in shell scripts (e.g. STATUS=$(python access.py -q ...))
 
 import subprocess
 import sys
@@ -14,18 +20,41 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+
+def _safe_print(text, end="\n", flush=False):
+    """Print to stdout, swallowing OS-level write errors (e.g. broken pipe,
+    Windows Invalid argument / errno 22 on large or binary-like output)."""
+    try:
+        sys.stdout.write(text + end)
+        if flush:
+            sys.stdout.flush()
+    except (OSError, BrokenPipeError):
+        # stdout is broken (pipe closed, Windows handle invalid, etc.).
+        # Don't crash — the data was already captured in output[].
+        pass
+
+
 def main():
-    if len(sys.argv) < 2:
+    args = sys.argv[1:]
+
+    # Strip --quiet / -q flag before passing the rest to the subprocess.
+    quiet = False
+    if args and args[0] in ("--quiet", "-q"):
+        quiet = True
+        args = args[1:]
+
+    if not args:
         print("Usage:")
-        print("  python access.py <command> [args...]")
+        print("  python access.py [--quiet|-q] <command> [args...]")
         sys.exit(1)
 
-    cmd = sys.argv[1:]
+    cmd = args
 
-    print("=" * 80)
-    print("Executing:")
-    print(" ".join(shlex.quote(arg) for arg in cmd))
-    print("=" * 80)
+    if not quiet:
+        _safe_print("=" * 80)
+        _safe_print("Executing:")
+        _safe_print(" ".join(shlex.quote(arg) for arg in cmd))
+        _safe_print("=" * 80)
 
     process = subprocess.Popen(
         cmd,
@@ -42,7 +71,7 @@ def main():
 
     try:
         for line in process.stdout:
-            print(line, end="", flush=True)
+            _safe_print(line, end="", flush=True)
             output.append(line)
 
         process.wait()
@@ -50,8 +79,9 @@ def main():
         process.terminate()
         process.wait()
 
-    print("\n" + "=" * 80)
-    print(f"Exit Code: {process.returncode}")
+    if not quiet:
+        _safe_print("\n" + "=" * 80)
+        _safe_print(f"Exit Code: {process.returncode}")
 
     sys.exit(process.returncode)
 

@@ -25,6 +25,7 @@ Package release under test: `6.8.12-zksu-multi` (`6.8.12-5`), rollback default `
 | `dw-fast-api` hotfix (SSH tunnel in prod) | ✅ `USE_SSH_TUNNEL` |
 | **`redroid-experimental` rooted (2nd instance)** | ✅ `lspd` pid 76, Zygisk Next + LSPosed |
 | Both instances rooted **simultaneously** | ✅ **multi-instance objective achieved** |
+| Guarded KernelSU replay watcher | ✅ watches both `5555` and `5557`; ignores manual `docker stop`; schedules one full VPS reboot only if a running container loses root injection state after container-only restart |
 | Rollback path preserved | ✅ `saved_entry` still `6.8.12-zksu` |
 
 ---
@@ -253,6 +254,82 @@ Both instances live **simultaneously**: `redroid14` `lspd` = **357**,
 throughout.
 
 **Multi-instance KernelSU objective: achieved and validated on the production host.**
+
+---
+
+## Phase 16 — Multi-instance KernelSU replay watcher
+
+Production already had `redroid-kernelsu-replay.service` for the known Docker/Coolify
+restart failure mode: a container-only restart preserves `/data`, but it can lose the
+runtime KernelSU/Zygisk/LSPosed injection chain until the host boots again. After
+`redroid-experimental` became the second rooted instance, the watcher was expanded
+from production-only to multi-instance.
+
+Updated host files:
+
+```text
+/usr/local/sbin/redroid-kernelsu-replay
+/etc/systemd/system/redroid-kernelsu-replay.service
+/home/ubuntu/kbuild/coolify/redroid-kernelsu-replay.sh
+/home/ubuntu/kbuild/coolify/redroid-kernelsu-replay.service
+```
+
+The active watcher now tracks separate services and separate recovery guards:
+
+| Service | ADB port | Docker label | Guard file |
+|---|---:|---|---|
+| `redroid14` | `5555` | `coolify.serviceName=redroid14` | `/var/lib/redroid-kernelsu-replay/pending-host-recovery-redroid14` |
+| `redroid-experimental` | `5557` | `coolify.serviceName=redroid-experimental` | `/var/lib/redroid-kernelsu-replay/pending-host-recovery-redroid-experimental` |
+
+For each new running container start timestamp, the watcher waits for Android boot,
+reapplies the stable hostname, then verifies:
+
+- `/data/adb/ksud -V` works;
+- `ksud module list` contains `zygisksu` and `zygisk_lsposed`;
+- `lspd` is running;
+- GSF, GMS, and Play Store packages exist;
+- production additionally has the active Conscrypt mitmproxy CA file.
+
+If a running, booted container fails that health check, the watcher writes that
+instance's pending guard and schedules **one full VPS reboot**. This intentionally
+distinguishes Docker/Coolify restart from host reboot: Docker restart is not trusted
+to reconstruct Zygisk/LSPosed state, while a full VPS reboot is the tested recovery
+path.
+
+Manual stop safety was added at the same time. A container that the operator stops
+with `docker stop` is ignored because the watcher enumerates only running containers.
+If a container is stopped while the watcher is mid boot/health polling, it records
+that start timestamp as a manual/container lifecycle event and does **not** write a
+pending recovery guard or reboot the VPS.
+
+Deployment / validation commands used:
+
+```powershell
+scp -i "C:\Users\Rishi\.ssh\ssh-key-2026-07-06(pvt).key" `
+  "KernelSU_setup\coolify\redroid-kernelsu-replay.sh" `
+  ubuntu@141.148.151.172:/tmp/redroid-kernelsu-replay.new
+
+ssh -i "C:\Users\Rishi\.ssh\ssh-key-2026-07-06(pvt).key" `
+  -o StrictHostKeyChecking=accept-new ubuntu@141.148.151.172 `
+  "bash -n /tmp/redroid-kernelsu-replay.new"
+
+ssh -i "C:\Users\Rishi\.ssh\ssh-key-2026-07-06(pvt).key" `
+  -o StrictHostKeyChecking=accept-new ubuntu@141.148.151.172 `
+  "sudo install -m 0755 -o root -g root /tmp/redroid-kernelsu-replay.new /usr/local/sbin/redroid-kernelsu-replay; sudo systemctl restart redroid-kernelsu-replay.service"
+
+ssh -i "C:\Users\Rishi\.ssh\ssh-key-2026-07-06(pvt).key" `
+  -o StrictHostKeyChecking=accept-new ubuntu@141.148.151.172 `
+  "systemctl is-enabled redroid-kernelsu-replay.service; systemctl is-active redroid-kernelsu-replay.service; sudo journalctl -u redroid-kernelsu-replay.service --since '2026-08-21 08:16:00 UTC' --no-pager -o cat | tail -20"
+```
+
+Validated result:
+
+```text
+redroid-kernelsu-replay.service: enabled
+redroid-kernelsu-replay.service: active
+KernelSU, Zygisk Next, LSPosed, and GApps are healthy for redroid14 (...)
+KernelSU, Zygisk Next, LSPosed, and GApps are healthy for redroid-experimental (...)
+```
 
 ---
 

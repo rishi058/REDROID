@@ -70,8 +70,8 @@ All files are in `KernelSU_setup/coolify/`:
 | `install-litegapps.sh` | Installs Magic Mount and verified LiteGapps in separate rebooted stages. |
 | `validate-coolify-redroid.sh` | Validates the root stack or the full GApps stack. |
 | `mitmproxy-ca-post-fs-data.sh` | Rebuilds Android 14's active Conscrypt APEX CA view with the local capture CA. |
-| `redroid-kernelsu-replay.sh` | Detects loss of LSPosed after a Coolify restart and schedules one guarded host reboot. |
-| `redroid-kernelsu-replay.service` | Keeps the guarded recovery watcher active on the VPS. |
+| `redroid-kernelsu-replay.sh` | Detects loss of KernelSU/Zygisk/LSPosed after a Coolify restart for production `5555` or experimental `5557`, then schedules one guarded host reboot. |
+| `redroid-kernelsu-replay.service` | Keeps the guarded multi-instance recovery watcher active on the VPS. |
 | `redroid-api-network.sh` | Reattaches recreated FastAPI containers, refreshes the production ReDroid network mapping, and calls `/adb/connect`. |
 | `redroid-api-network.service` | Keeps API networking and its ADB transport healthy without restarting ReDroid. |
 
@@ -780,15 +780,30 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now redroid-kernelsu-replay.service
 ```
 
-For each new container start timestamp the watcher:
+For each new container start timestamp on either `redroid14` (`5555`) or
+`redroid-experimental` (`5557`), the watcher:
 
 1. waits for Android boot completion;
 2. allows another minute for LSPosed startup;
-3. checks GSF, the active Conscrypt CA, and a running `lspd` process;
+3. checks KernelSU `ksud`, Zygisk Next, LSPosed, GSF/GMS/Play Store, and a
+   running `lspd` process;
 4. when any check is missing, writes a persistent recovery-pending guard and
    schedules one complete VPS reboot;
 5. clears the guard only after the next host boot passes every check;
 6. refuses a second reboot when the pending guard remains, preventing a loop.
+
+Manual stop safety: the watcher uses `docker ps`, so a container that the
+operator intentionally stopped is not considered for recovery. It also rechecks
+Docker's running state during boot and health polling. If a container is stopped
+while the watcher is mid-check, the watcher records that start timestamp as a
+manual/container lifecycle event and does not write a pending reboot marker.
+
+Multi-instance behavior: production and experimental use separate service labels,
+stable hostnames, and pending guard files. A failed recovery check for `5557` does
+not reuse the `5555` guard, and a failed `5555` check does not consume the `5557`
+guard. The service still schedules a host reboot rather than a Docker restart,
+because only a VPS boot is known to replay the complete KernelSU/Zygisk/LSPosed
+chain.
 
 Do not replace this with repeated `ksud post-fs-data` plus Android soft reboots.
 That experiment restored GApps/CA mounts but left `lspd` absent, so Target-App
@@ -809,6 +824,8 @@ Both recovery cases were tested:
 - Coolify **Restart**: the watcher detected missing `lspd`, logged
   `scheduling one guarded VPS reboot`, and rebooted the host once. The following
   boot logged that KernelSU, LSPosed, GApps, and CA were healthy.
+- manual `docker stop`: treated as operator intent. The watcher should not loop,
+  log repeated errors, or schedule a VPS reboot for a stopped container.
 
 After that exact Coolify Restart recovery, Target-App retained PID `2469` at every
 30-second sample from 0 through 300 seconds. Runtime logs again showed PairIPFix
