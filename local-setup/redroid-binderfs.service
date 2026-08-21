@@ -1,0 +1,14 @@
+[Unit]
+Description=Mount BinderFS for Redroid containers
+DefaultDependencies=no
+After=local-fs.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'grep -qw binder /proc/filesystems && mkdir -p /dev/binderfs && (mountpoint -q /dev/binderfs || mount -t binder binder /dev/binderfs -o max=1048576)'
+ExecStop=/bin/sh -c 'mountpoint -q /dev/binderfs && umount /dev/binderfs || true'
+
+[Install]
+WantedBy=sysinit.target
