@@ -8,7 +8,7 @@ test "$(id -u)" -eq 0
 install -d -m 0755 "$MOUNTPOINT"
 
 if ! mountpoint -q "$MOUNTPOINT"; then
-  mount -t binder -o max=3 binder-experimental "$MOUNTPOINT"
+  mount -t binder -o max=1048576 binder-experimental "$MOUNTPOINT"
 fi
 
 test -c "$MOUNTPOINT/binder-control"

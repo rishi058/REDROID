@@ -11,10 +11,14 @@ services:
     stop_grace_period: 10s
     ports:
       - "127.0.0.1:5557:5555"
-    networks:
-      redroid-persistent:
-        aliases:
-          - redroid-experimental
+    # Single-home the container on ONE NAT-capable network only. ReDroid's
+    # ipconfigstore configures only eth0 and reads its gateway from
+    # /proc/net/route at boot. With two networks, redroid-persistent could win
+    # eth0 while the default route landed on eth1 (which ReDroid never
+    # configures) -> ipconfigstore wrote gateway=empty -> Android netd built no
+    # default route -> DNS failed with ENONET. Under Coolify the per-service
+    # network is attached automatically, so no explicit network is declared
+    # here. Do NOT re-add redroid-persistent to this service.
     volumes:
       - /dev/binderfs-experimental/binder:/dev/binder
       - /dev/binderfs-experimental/hwbinder:/dev/hwbinder
@@ -52,8 +56,3 @@ services:
       - service.adb.tcp.port=5555
       - ro.secure=0
       - ro.debuggable=1
-
-networks:
-  redroid-persistent:
-    external: true
-    name: redroid-persistent
