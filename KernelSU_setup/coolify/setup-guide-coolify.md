@@ -1303,6 +1303,130 @@ Anything else installed via `com.android.shell` should be treated as the worm.
 
 Open Play Store inside Android through `scrcpy` and enter Google credentials only in the Android UI. Do not put a password in ADB commands, shell history, scripts, logs, or this document.
 
+### Play Store shows stale signed-in / authentication-required state
+
+**Symptom**
+
+Play Store opens but still shows the old signed-in/authentication state, for
+example `Authentication is required. You need to sign in to your Google Account`,
+even after clearing Play Store data or signing in again. `dumpsys account` may
+still show a stale `com.google` account.
+
+**What was checked**
+
+Google's Play troubleshooting guidance and emulator-specific guidance both point
+to the same fix order: clear Play Store data, clear Play Services data, then
+remove and re-add the Google account. APKMirror currently publishes newer Play
+Store and Play Services builds, but both packages are split APK families. Do not
+blindly sideload a random APK/APKM over this LiteGapps systemless stack: a wrong
+API, ABI, DPI, or split set can break `Phonesky` or GMS harder than the original
+auth issue. Prefer reinstalling the mounted LiteGapps packages for Android user
+0 unless there is a verified complete split set.
+
+**Fix used on `redroid-experimental` / port 5557**
+
+This removes stale AccountManager state, clears the Google app data stores, and
+reinstalls the existing LiteGapps system packages for user 0. Run from the VPS:
+
+```bash
+CONTAINER=$(sudo docker ps -q --filter 'label=coolify.serviceName=redroid-experimental')
+
+sudo docker exec "$CONTAINER" sh -c '
+  am force-stop com.android.vending 2>/dev/null || true
+  am force-stop com.google.android.gms 2>/dev/null || true
+  am force-stop com.google.android.gsf 2>/dev/null || true
+
+  pm clear com.android.vending
+  pm clear com.google.android.gms
+  pm clear com.google.android.gsf
+  pm clear com.google.android.googlequicksearchbox 2>/dev/null || true
+
+  rm -f /data/system_ce/0/accounts_ce.db* /data/system_de/0/accounts_de.db*
+
+  pm uninstall --user 0 com.android.vending 2>/dev/null || true
+  pm uninstall --user 0 com.google.android.gms 2>/dev/null || true
+  pm uninstall --user 0 com.google.android.gsf 2>/dev/null || true
+
+  cmd package install-existing --user 0 com.google.android.gsf
+  cmd package install-existing --user 0 com.google.android.gms
+  cmd package install-existing --user 0 com.android.vending
+
+  pm enable --user 0 com.google.android.gsf
+  pm enable --user 0 com.google.android.gms
+  pm enable --user 0 com.android.vending
+  pm enable --user 0 com.android.providers.downloads
+  pm enable --user 0 com.android.providers.downloads.ui
+
+  settings delete global http_proxy 2>/dev/null || true
+'
+```
+
+If clearing GMS/GSF temporarily drops Android's package service and later
+commands print `cmd: Can't find service: package` or `Broken pipe`, wait for the
+framework to recover and run only the `install-existing` / `pm enable` block
+again. On the verified 5557 run the packages remained visible after recovery.
+
+**Validation**
+
+```powershell
+$d = '127.0.0.1:5557'
+adb connect $d
+adb -s $d shell dumpsys account | findstr /I "Accounts: Account {name="
+adb -s $d shell dumpsys account | findstr /I "Accounts:"
+adb -s $d shell am start -a android.intent.action.VIEW -d "market://details?id=com.google.android.gms"
+adb -s $d shell dumpsys activity activities | findstr /I "topResumedActivity ResumedActivity"
+adb -s $d shell uiautomator dump /sdcard/window.xml
+adb -s $d shell cat /sdcard/window.xml | findstr /I "Sign in Authentication required Try again Google Account"
+```
+
+Expected post-reset state:
+
+```text
+Accounts: 0
+topResumedActivity=... com.android.vending/com.google.android.finsky.unauthenticated.activity.UnauthenticatedMainActivity ...
+Sign in to find the latest Android apps, games, movies, music, & more
+Sign in
+```
+
+At that point the old Google account is gone and Play Store is presenting a
+fresh sign-in surface. Re-enter credentials only through the Android UI.
+
+**Variant — preserve a registered GSF ID (keep certification)**
+
+If a registered GSF `android_id` was injected for Play Protect certification, do
+**not** `pm clear` or uninstall `com.google.android.gsf`: that regenerates the
+`android_id` and invalidates the registration. Reset only the account and
+Play/GMS state, leave GSF untouched, then restart the container:
+
+```bash
+CONTAINER=$(sudo docker ps -q --filter 'label=coolify.serviceName=redroid-experimental')
+
+sudo docker exec "$CONTAINER" sh -c '
+  am force-stop com.android.vending 2>/dev/null || true
+  am force-stop com.google.android.gms 2>/dev/null || true
+  am force-stop com.google.android.gsf 2>/dev/null || true
+  pm clear com.android.vending
+  pm clear com.google.android.gms
+  pm clear com.google.android.googlequicksearchbox 2>/dev/null || true
+  rm -f /data/system_ce/0/accounts_ce.db* /data/system_de/0/accounts_de.db*
+  settings delete global http_proxy 2>/dev/null || true
+'
+
+# system_server keeps the removed account cached until it reloads,
+# so restart the container to finalize the account removal.
+sudo docker restart "$CONTAINER"
+```
+
+`dumpsys account` still reports `Accounts: 1` until the restart; afterward it is
+`Accounts: 0` with the injected `android_id` intact. Verify the ID persisted:
+
+```bash
+sudo docker cp "$CONTAINER":/data/data/com.google.android.gsf/databases/gservices.db /tmp/g.db
+sudo chmod 644 /tmp/g.db
+python3 -c "import sqlite3;print(sqlite3.connect('/tmp/g.db').execute(\"select value from main where name='android_id'\").fetchone())"
+sudo rm -f /tmp/g.db
+```
+
 Play Store availability does not imply Play Protect certification or Play Integrity. If Play Protect registration is required, follow the GSF ID procedure in `KernelSU_setup/setup_guide.md` section 12.8. Keep `/home/ubuntu/redroid14-data` unchanged after registering, because recreating Android data changes the GSF ID.
 
 The on-device check is **Profile → Settings → About → Play Protect

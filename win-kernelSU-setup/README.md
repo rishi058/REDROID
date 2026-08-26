@@ -564,3 +564,9 @@ likely pass; **STRONG** depends on the keybox being valid/unrevoked — the publ
 TEESimulator there is no forge fallback, so STRONG is not expected to pass here.
 
 This README is updated after each step and each blocker+solution.
+
+adbd runs but refuses to open the 5555 listener — the only listener is docker's internal DNS (127.0.0.11), not adbd. The cause: the redroid_pixel5 genuine-device module forces ro.debuggable=0 + ro.secure=1, which makes adbd behave like a production device and not auto-open network adb. That's the same class of side effect the README §11.4 flagged. Let me override those props with resetprop (KernelSU) for this session and restart adbd.
+
+adbd is now listening on 5555 (state 0A, all interfaces) — the key was sys.usb.config=adb (redroid gates the network adb listener on that). There's already an established connection from the docker gateway. ro.adb.secure=0, so no key auth needed. Let me connect from WSL and verify the framework, then disable Bluetooth to stop the crash churn.
+
+Now I have a stable, working channel: WSL adb → 172.18.0.2:5555 = "device", framework responsive (ro.product.model=Pixel 5, boot=1), Flezen installed, and Bluetooth disabled (Success, bluetooth_on=0) to stop the crash churn. sys.usb.config=adb was the missing piece.

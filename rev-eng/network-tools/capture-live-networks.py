@@ -177,7 +177,7 @@ class JsonCapture:
             "server": address(flow.server_conn),
             "error": str(flow.error) if flow.error else None,
         }
-        if flow.websocket:
+        if getattr(flow, "websocket", None):  # mitmproxy 6.x HTTPFlow has no .websocket
             record["websocket_messages"] = [
                 {
                     "from_client": message.from_client,

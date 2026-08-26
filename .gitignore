@@ -77,3 +77,6 @@ local-setup/artifacts/gapps/*.zip
 flezen 
 DW-fast-api
 rev-eng-flezen
+GMS_GSF_ID.txt
+_session
+.tmp
