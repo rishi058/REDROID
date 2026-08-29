@@ -1,0 +1,6 @@
+id=droidguard_tracer
+name=DroidGuard Signal Tracer/Harmonizer
+version=v0.1-diagnostic
+versionCode=1
+author=redroid-integrity-debug
+description=Diagnostic tracer + prop-level environment harmonizer for DroidGuard/Play Integrity on redroid. Logs the signals DroidGuard reads and normalizes the proppable ones. Deeper (sensor/kernel/keystore) harmonization needs the Zygisk component (see README).
