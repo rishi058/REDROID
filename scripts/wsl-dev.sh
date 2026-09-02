@@ -22,7 +22,7 @@
 #   wsl-dev.sh sync      # copy only
 #   wsl-dev.sh status    # what is up, and is the chain installed
 #   wsl-dev.sh stop      # stop both and remove the redirect chain
-set -euo pipefail
+set -Eeuo pipefail
 
 SRC="${FLEZEN_SRC:-/mnt/d/PROJECT/_TRASH/REDROID}"
 # NOT under $HOME: /root is 0700, and the self-test re-execs main.py as the
@@ -33,6 +33,9 @@ DST="${FLEZEN_DST:-/opt/flezen-dev}"
 REDROID="${REDROID_CONTAINER:-redroid14}"
 LOCK=/tmp/flezen-dev-sync.lock
 KEY="${FLEZEN_DEV_KEY:-devkey}"
+
+trap 'rc=$?; [ $rc -ne 0 ] && printf "[31mwsl-dev: aborted at line $LINENO (exit $rc)[0m
+" >&2; exit $rc' ERR
 
 die() { printf '\033[31mwsl-dev: %s\033[0m\n' "$*" >&2; exit 1; }
 say() { printf '\033[36mwsl-dev:\033[0m %s\n' "$*"; }
@@ -91,7 +94,11 @@ ensure_ca() {
     local pem="$SRC/DW-fast-api/certs/mitmproxy-ca.pem"
     [ -f "$pem" ] || die "CA not found: $pem"
     mkdir -p "$DST/ca"
-    cp -f "$pem" "$DST/ca/mitmproxy-ca.pem"
+    # rm first: the destination is left 0400, and cp onto it is not reliably
+    # permitted. This aborted the whole script with no message before the ERR
+    # trap above existed.
+    rm -f "$DST/ca/mitmproxy-ca.pem"
+    cp "$pem" "$DST/ca/mitmproxy-ca.pem"
     chmod 400 "$DST/ca/mitmproxy-ca.pem"
     grep -q 'PRIVATE KEY' "$DST/ca/mitmproxy-ca.pem" \
         || die "that PEM has no private key; mitmproxy cannot forge certs with it"
@@ -104,7 +111,19 @@ run_sidecar() {
     ensure_ca
     local pid ip uid
     pid="$(netns_pid)"; ip="$(netns_ip)"; uid="$(app_uid)"
-    [ -n "$uid" ] || die "could not read the Flezen app uid; is the app installed?"
+    if [ -z "$uid" ]; then
+        # A restarted Redroid answers `docker exec` long before Android's
+        # package manager is up, so an immediate read returns nothing and the
+        # rule would be installed against uid "" -- matching nothing, and
+        # looking perfectly healthy.
+        say "waiting for Android to finish booting (pm not ready yet)"
+        for _ in $(seq 1 30); do
+            sleep 2
+            uid="$(app_uid)"
+            [ -n "$uid" ] && break
+        done
+    fi
+    [ -n "$uid" ] || die "could not read the Flezen app uid after 60s; is the app installed?"
 
     # These beat the repo .env: load_env_file never overrides the environment,
     # which is exactly what makes it safe to keep an api-mode .env for Windows
