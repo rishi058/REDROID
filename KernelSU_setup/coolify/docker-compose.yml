@@ -29,6 +29,12 @@ services:
       - "5555:5555"
     networks:
       redroid-persistent:
+        # Coolify injects its NAT-capable per-service network separately. Pin
+        # this auxiliary bridge to eth1 and give it a lower gateway priority so
+        # Android always boots the Coolify endpoint as eth0. This also avoids
+        # the dual-network attachment race documented in network-fix.md.
+        interface_name: eth1
+        gw_priority: -1
         aliases:
           - redroid14
           - redroid14-ksu

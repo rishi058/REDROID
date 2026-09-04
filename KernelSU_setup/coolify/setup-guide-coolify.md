@@ -216,10 +216,33 @@ ports:
   - "5555:5555"
 networks:
   redroid-persistent:
+    interface_name: eth1
+    gw_priority: -1
     aliases:
       - redroid14
       - redroid14-ksu
 ```
+
+Coolify injects its NAT-capable per-service network into the generated Compose.
+`interface_name: eth1` and `gw_priority: -1` deliberately keep
+`redroid-persistent` secondary, leaving the injected network as Android's
+`eth0`/default route even when Docker restores endpoints in a different order.
+Do not depend on the order of the YAML network keys alone.
+
+The generated deployment currently pins ReDroid to `172.17.0.2` on network
+`kkssbzfd0c3sjec5nhs6g2mi`. That external network must reserve a separate
+dynamic pool for `coolify-proxy`; otherwise the proxy can claim `.2` first after
+a reboot and ReDroid fails with `Address already in use`:
+
+```bash
+sudo docker network inspect kkssbzfd0c3sjec5nhs6g2mi --format \
+  '{{range .IPAM.Config}}subnet={{.Subnet}} ip_range={{.IPRange}}{{end}}'
+# Expected: subnet=172.17.0.0/16 ip_range=172.17.128.0/17
+```
+
+The complete recreation runbook and evidence are in `network-fix.md`, Incident
+4. Preserve these settings in Coolify's raw service definition as well as the
+generated deployment YAML.
 
 The service mounts the three persistent BinderFS nodes and the persistent Android data directory. It also maps `/dev/kmsg` to `/dev/null`, so Android cannot write the real host kernel log. `restart: unless-stopped` makes the Coolify-managed container return automatically after Docker or the VPS restarts; the memory and PID limits still bound a failed workload.
 

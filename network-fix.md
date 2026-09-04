@@ -84,12 +84,17 @@ The only exits are:
 
 ## Prevention
 
-The root cause is the race between `redroid-persistent` and `kkssbzfd0c3sjec5nhs6g2mi` at container start. To prevent recurrence, **either**:
+The original single-home recovery was later replaced by an explicitly ordered
+dual-network configuration because `redroid-persistent` is required for stable
+FastAPI-to-ReDroid addressing. The maintained Compose source pins that auxiliary
+endpoint to `eth1` with `gw_priority: -1`; Coolify's NAT-capable service network
+therefore remains the `eth0`/default-route path. Do not rely on YAML key order
+alone: Docker restoration order after a host reboot is not a stable interface
+assignment contract.
 
-- **Remove `redroid-persistent` permanently.** It was added to survive Coolify redeploys, but if Coolify is stable this is unnecessary. Reconnecting to the Coolify service network on each deploy is the cleaner design.
-- **Or** set `redroid-persistent` as a secondary interface with no gateway in Docker Compose, and ensure the Coolify network is listed first so it wins the eth0 assignment on boot. (Docker assigns eth0 to the first network in the container's configuration order.)
-
-The `redroid-persistent` network is still disconnected from redroid14 as of the fix. Redroid14 is now single-homed on `kkssbzfd0c3sjec5nhs6g2mi`.
+The Coolify service network also uses a restricted dynamic allocation pool so
+its generated static ReDroid address cannot be claimed by `coolify-proxy`. See
+Incident 4 below.
 
 ---
 
@@ -431,3 +436,131 @@ sudo docker compose \
 ```
 
 After recreation, `HostConfig.NetworkMode` referenced the new ReDroid ID, the sidecar became healthy, `0.0.0.0:8002` listened in the shared namespace, DW-fast-api's authenticated `/v1/captures` request succeeded, and a Flezen `file_details` flow was captured.
+
+---
+
+# Incident 4 — Production ReDroid failed to start after reboot (static IP collision)
+
+**Date:** 2026-09-04
+
+**Container:** `redroid14-kkssbzfd0c3sjec5nhs6g2mi` (production)
+
+**Symptom:** After a full VPS reboot, Docker left production ReDroid stopped with
+exit code `255` and no Android boot state:
+
+```text
+failed to set up container networking: Address already in use
+```
+
+## Diagnosis
+
+This error occurred before Android started; it was not an ADB, BinderFS,
+KernelSU, memory, or app failure. Coolify's generated Compose pinned ReDroid on
+its service network:
+
+```yaml
+kkssbzfd0c3sjec5nhs6g2mi:
+  ipv4_address: 172.17.0.2
+```
+
+The network's default dynamic pool covered the entire `172.17.0.0/16` subnet.
+During daemon restoration, `coolify-proxy` attached first and dynamically
+received `172.17.0.2`. ReDroid then attempted to claim the same generated static
+address and Docker rejected its network setup. The decisive comparison was:
+
+```text
+Coolify-generated redroid14 address: 172.17.0.2
+coolify-proxy runtime address:       172.17.0.2
+```
+
+`docker inspect` of the service network and the generated file under
+`/data/coolify/services/kkssbzfd0c3sjec5nhs6g2mi/` are required for this
+diagnosis. A host-port check alone is insufficient.
+
+## Durable fix
+
+Recreate the Coolify service network with a dynamic allocation range that does
+not include the low static address. Perform this only while ReDroid is stopped,
+after confirming the network contains no application endpoint other than
+`coolify-proxy`:
+
+```bash
+N=kkssbzfd0c3sjec5nhs6g2mi
+
+sudo docker network inspect "$N"
+sudo docker network disconnect "$N" coolify-proxy
+sudo docker network rm "$N"
+sudo docker network create \
+  --driver bridge \
+  --attachable \
+  --subnet 172.17.0.0/16 \
+  --gateway 172.17.0.1 \
+  --ip-range 172.17.128.0/17 \
+  "$N"
+sudo docker network connect "$N" coolify-proxy
+```
+
+The resulting contract is:
+
+```text
+ReDroid generated static address: 172.17.0.2
+Dynamic addresses:                172.17.128.0/17
+```
+
+The dynamic allocator can no longer hand ReDroid's address to the proxy. This
+network is external and survived the subsequent validation reboot.
+
+The second half of the fix makes interface/default-route selection deterministic.
+Persist these properties in both Coolify's `docker_compose_raw` source and its
+normalized Compose, not only in the generated deployment file:
+
+```yaml
+networks:
+  redroid-persistent:
+    interface_name: eth1
+    gw_priority: -1
+    aliases:
+      - redroid14
+      - redroid14-ksu
+```
+
+Coolify injects its own service network, which remains `eth0` and wins the
+default gateway. The repository source at
+`KernelSU_setup/coolify/docker-compose.yml` carries the same settings so a
+future GUI paste or service recreation does not regress the ordering.
+
+After applying the generated Compose change, recreate ReDroid and perform the
+documented full VPS reboot. A container-only recreation is not the final state:
+KernelSU boot stages must re-establish Zygisk, LSPosed, GApps, and the CA overlay
+during the host boot sequence.
+
+## Validation
+
+The repair was tested through a full VPS reboot, not only a force-recreate:
+
+```text
+redroid14 container: running, healthy, restart_count=0
+sys.boot_completed:  1
+init.svc.adbd:        running
+Coolify endpoint:    eth0 = 172.17.0.2/16
+Internet:            8.8.8.8 reachable
+KernelSU watcher:    KernelSU, Zygisk Next, LSPosed, and GApps healthy
+DW-fast-api /health: status=ok, adb_ready=true, adb_transport_online=true
+DW-fast-api /ready:  HTTP 200
+```
+
+Use these checks after any future service-network recreation:
+
+```bash
+N=kkssbzfd0c3sjec5nhs6g2mi
+C=$(sudo docker ps -q --filter 'label=coolify.serviceName=redroid14')
+
+sudo docker network inspect "$N" --format \
+  '{{range .IPAM.Config}}subnet={{.Subnet}} ip_range={{.IPRange}}{{end}} {{json .Containers}}'
+sudo docker inspect "$C" --format \
+  'status={{.State.Status}} health={{.State.Health.Status}} networks={{json .NetworkSettings.Networks}}'
+sudo docker exec "$C" sh -c \
+  'getprop sys.boot_completed; ip -br addr; ip route; ping -c 1 -W 3 8.8.8.8'
+sudo journalctl -u redroid-kernelsu-replay.service -b --no-pager
+curl -fsS http://127.0.0.1:8001/ready
+```
