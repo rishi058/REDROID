@@ -331,7 +331,46 @@ resolution is the service-identity contract. Coolify also attaches its proxy to
 service networks, so seeing both ReDroid and `coolify-proxy` as endpoints is
 expected and is not a stale deployment.
 
-### 4.1 Persist FastAPI access to ADB
+### 4.1 Isolate Android netd BPF per ReDroid instance
+
+Every ReDroid service must use `cgroup: private`, and the VPS must boot with
+unified cgroup v2:
+
+```yaml
+services:
+  redroid14:
+    privileged: true
+    cgroup: private
+```
+
+Do not force the host back to cgroup v1. On a cgroup-v1 host, both Android 14
+instances attach `prog_netd_cgroupsock_inet_create` to the same root even when
+Compose requests a private namespace. The instance started last then applies
+its UID-permission map to both Android systems; an app-ID collision can make
+`socket(AF_INET6, SOCK_STREAM, ...)` fail with `EPERM` in the other instance.
+
+Remove these legacy arguments from `/etc/default/grub` and every file under
+`/etc/default/grub.d/`, run `sudo update-grub`, and reboot:
+
+```text
+systemd.unified_cgroup_hierarchy=0
+systemd.legacy_systemd_cgroup_controller=1
+```
+
+Verify after recreating both ReDroid containers:
+
+```bash
+sudo docker info --format 'cgroup={{.CgroupVersion}} driver={{.CgroupDriver}}'
+sudo docker inspect --format 'cgroupns={{.HostConfig.CgroupnsMode}}' \
+  redroid14-kkssbzfd0c3sjec5nhs6g2mi
+```
+
+Expected: `cgroup=2 driver=systemd` and `cgroupns=private`. Coolify 4.1.2's
+Compose service parser accepts `cgroup: private`; this is a Compose key, not a
+Custom Docker Options flag. See `network-fix.md` for the traced incident and
+BPF program-ID validation.
+
+### 4.2 Persist FastAPI access to ADB
 
 The FastAPI source of truth is `D:\PROJECT\_TRASH\DW-fast-api`. Its Compose file
 contains:

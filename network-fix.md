@@ -106,6 +106,51 @@ The `redroid-persistent` network is still disconnected from redroid14 as of the 
 
 **Practical takeaway:** After any full VPS reboot, don't trust `sys.boot_completed=1` or ADB reachability alone as the signal that the capture pipeline is ready. Budget roughly **10 minutes** of warm-up before relying on `POST /video`/`POST /playlist` succeeding, or poll `logcat` for a clean (non-`EPERM`) app-level network call as the real readiness signal.
 
+### 2026-09-04 correction — confirmed cgroup BPF collision, not a warm-up window
+
+The same failure was reproduced long after boot and traced from the host while
+Diskwala attempted `/session`:
+
+```text
+socket(AF_INET6, SOCK_STREAM, IPPROTO_IP) = -1 EPERM (Operation not permitted)
+```
+
+Both ReDroid containers were running with Docker's host cgroup namespace on a
+cgroup-v1 host. Android 14's netd in each instance attached
+`prog_netd_cgroupsock_inet_create` to the same cgroup-v2 root. The later-started
+experimental instance replaced production's program:
+
+```text
+production pinned program:   55
+experimental pinned program: 88
+program attached at root:    88
+```
+
+The attached program used the experimental instance's
+`map_netd_uid_permission_map`. Experimental app ID `10095` had permission value
+`0x00`; production Diskwala independently used the same app ID. The foreign
+netd program consequently rejected production's socket creation before proxy,
+DNS, TCP connect, TLS, or HTTP. This explains why shell-level connectivity was
+healthy, app restarts did nothing, and reboot outcome depended on instance
+startup order.
+
+The permanent fix has two required parts:
+
+1. Boot the VPS with unified cgroup v2 (remove
+   `systemd.unified_cgroup_hierarchy=0` and
+   `systemd.legacy_systemd_cgroup_controller=1` from GRUB and its drop-ins).
+2. Set `cgroup: private` for **every** ReDroid Compose service and recreate the
+   containers. Private namespaces alone were tested on the old cgroup-v1 host
+   and did not isolate the attachment.
+
+After migration Docker reported cgroup v2 with the systemd driver. Production
+and experimental had different pinned and attached program IDs (`87` and
+`134` respectively), `POST /video` returned HTTP 200 in 2.677 seconds, and no
+new `socket failed: EPERM` or `/session` bootstrap errors appeared. Coolify
+4.1.2's generated Compose (Docker Compose 5.4.0) accepted and persisted the
+`cgroup: private` service key; this was validated rather than inferred from the
+Custom Docker Options whitelist.
+
 **Separately, in the same reboot cycle:** Play Store (`com.android.vending`) failed to launch with `Failed to open APK '/system/product/priv-app/Phonesky/Phonesky.apk': I/O error` — caused by an *earlier, docker-only* restart of redroid14 (done to fix the ADB issue documented above) not fully replaying KernelSU's Magic Mount overlay for the GApps module. This is a distinct issue from the network warm-up above; it was fixed immediately by the full VPS reboot (matches `rev-eng/docs/05-Follow-Up-Fixes.md`'s existing warning that a docker-only restart doesn't reliably re-arm KernelSU's boot stages — only a full host reboot does).
 
 ---
@@ -235,3 +280,154 @@ The trap is a **persistent** proxy setting that depends on an **ephemeral** `adb
 - **Tie the proxy to the tunnel's lifecycle.** Whatever sets `settings put global http_proxy 127.0.0.1:5556` should also be responsible for (re)creating `adb reverse tcp:5556` on every ADB (re)connect, and for clearing the proxy (`http_proxy :0`) when the capture pipeline stops. Never leave the proxy set while the reverse is down.
 - **Re-assert the reverse after any reconnect.** Since `adb connect` / `adb kill-server` / SSH-tunnel blips wipe reverse mappings, the capture startup (and any reconnect helper) must re-run `adb reverse tcp:5556 …` before relying on app traffic.
 - **Diagnose by the error, not the vibe.** `net::ERR_PROXY_CONNECTION_FAILED` (proxy failure) is categorically different from `ERR_NAME_NOT_RESOLVED`/`ERR_INTERNET_DISCONNECTED` (real network failure). First triage step: `settings get global http_proxy` + `adb reverse --list` + in-container `ping 8.8.8.8`/`ping google.com`. If ping/DNS work but apps don't, it's the proxy, not the network — do **not** reboot the VPS for this.
+
+---
+
+# Incident 3 — Experimental ADB offline after VPS reboot (stale Docker endpoint)
+
+**Date:** 2026-09-03
+**Container:** `redroid-experimental-bk6ojzx98y1dlabu4d63c6d3` (experimental, VPS loopback port 5557 → container port 5555)
+**Symptom:** The SSH tunnel was reachable, but `adb connect 127.0.0.1:5557` returned `offline`, `failed to connect`, or a protocol reset. `scrcpy` failed with `state=offline`.
+
+## What was healthy
+
+Android itself had completed boot:
+
+```text
+sys.boot_completed=1
+dev.bootcomplete=1
+init.svc.adbd=running
+```
+
+Real `adbd` owned `*:5555`; no known `com.hagaseca.thost9`/`thost4` ADB-worm packages or non-`adbd` port owner were present. Restarting `adbd` and reasserting `service.adb.tcp.port=5555` therefore did not address the root cause.
+
+## Root cause
+
+Docker's published-port path was stale after the host reboot:
+
+```text
+127.0.0.1:5557 → Docker proxy/NAT → 172.21.0.2:5555
+```
+
+`docker inspect` claimed that the Coolify network `bk6ojzx98y1dlabu4d63c6d3` had assigned `172.21.0.2` to the container. The running network namespace disagreed:
+
+```text
+eth0 = 172.29.14.2/24 (redroid-persistent)
+eth1 = link-local IPv6 only; no 172.21.0.2 IPv4 address
+```
+
+Consequently, the VPS could reach `172.29.14.2:5555` directly, but Docker's published port targeted the nonexistent `172.21.0.2:5555` path and returned `No route to host`. A TCP listener on host port 5557 was not proof that its container-side destination was usable.
+
+This is the same dual-network materialization class as Incident 1, but with a different visible state: the secondary interface existed while its Docker-assigned IPv4 address was missing.
+
+## Recovery used (experimental only; no container or VPS restart)
+
+First reconnect the Coolify endpoint with negative gateway priority. The negative priority is important: reconnecting normally failed while Docker attempted to install the Coolify gateway.
+
+```bash
+C=$(sudo docker ps -q --filter 'label=coolify.serviceName=redroid-experimental')
+N=bk6ojzx98y1dlabu4d63c6d3
+
+sudo docker network disconnect -f "$N" "$C"
+sudo docker network connect \
+  --gw-priority -1 \
+  --ip 172.21.0.2 \
+  --alias redroid-experimental \
+  "$N" "$C"
+
+# ReDroid/Android still omitted the IPv4 address from the live namespace.
+sudo docker exec "$C" ip addr add 172.21.0.2/16 dev eth1
+```
+
+ARP resolution for that endpoint also remained incomplete, so the VPS bridge neighbor was restored using the interface's actual MAC address:
+
+```bash
+MAC=$(sudo docker exec "$C" cat /sys/class/net/eth1/address)
+sudo ip neigh replace 172.21.0.2 lladdr "$MAC" nud permanent \
+  dev br-58de1859c45f
+```
+
+Then reset the client transport:
+
+```powershell
+adb disconnect 127.0.0.1:5557
+adb kill-server
+adb start-server
+adb connect 127.0.0.1:5557
+adb devices -l
+```
+
+Final validation returned `device`, `sys.boot_completed=1`, and scrcpy successfully streamed the Android 14 display.
+
+## Diagnostic checklist
+
+Do not classify every `offline` result as the documented ADB worm. Check each layer:
+
+```bash
+# Docker's intended destination
+sudo docker inspect "$C" --format '{{json .NetworkSettings.Networks}} {{json .NetworkSettings.Ports}}'
+
+# Actual interfaces and routes (source of truth)
+sudo docker exec "$C" ip -br addr
+sudo docker exec "$C" ip route
+
+# Real owner of the Android port
+sudo docker exec "$C" ss -ltnp | grep ':5555'
+
+# Compare both network paths
+nc -vz 172.21.0.2 5555
+nc -vz 172.29.14.2 5555
+```
+
+If Docker metadata lists an IPv4 address that `ip -br addr` does not show, repair the network endpoint before changing `adbd`.
+
+## Permanent fix applied
+
+The explicit `ip addr` and static-neighbor commands above were only the initial runtime recovery. On 2026-09-03, the Coolify-managed deployment was permanently changed to make `redroid-experimental` **single-homed**:
+
+- removed `redroid-persistent` from the experimental service;
+- retained only Coolify's NAT-capable per-service network;
+- configured that endpoint as `eth0` with gateway priority `1` in the generated live Compose file;
+- removed `redroid-persistent` from both `docker_compose_raw` and parsed `docker_compose` for Coolify service ID `4`, preventing a later Coolify redeploy from restoring the broken topology;
+- aligned `/home/ubuntu/kbuild/coolify/experimental/docker-compose.yml` with the repository rule that the experimental service must not declare `redroid-persistent`.
+
+Only `redroid-experimental` was force-recreated. Production `redroid14` was not restarted or modified.
+
+Post-recreation validation:
+
+```text
+Docker network count: 1
+Interface: eth0 = 172.21.0.2/16
+Android policy route: default via 172.21.0.1 table 1002
+Internet: 8.8.8.8 reachable
+Container health: healthy
+ADB 127.0.0.1:5557: device
+sys.boot_completed: 1
+scrcpy: Android 14 video stream successful
+```
+
+ARP now resolves dynamically to the container endpoint; the temporary permanent-neighbor entry was removed before recreation. Because the service now has only one network, Docker cannot reverse the attachment order or publish port 5557 toward a missing secondary IPv4 endpoint after a reboot.
+
+### Required dependent recovery: recreate `flezen-sidecar`
+
+Recreating `redroid-experimental` gives it a new container ID and network namespace. The Flezen sidecar's configured `network_mode: container:<redroid-name>` is resolved by Docker to that container ID **when the sidecar is created**. Restarting an existing sidecar does not retarget its `HostConfig.NetworkMode` to the replacement ReDroid container.
+
+Immediately after the permanent network fix, the old sidecar remained pinned to deleted ReDroid ID `ddd75aea…`, while the new ReDroid ID was `90c20c4b…`. It exited and port `172.21.0.2:8002` had no listener, causing:
+
+```text
+Flezen sidecar unavailable: GET /v1/captures failed:
+ClientConnectorError: Cannot connect to host 172.21.0.2:8002
+```
+
+Recovery requires a sidecar **recreate**, not merely a restart:
+
+```bash
+D=/data/coolify/applications/n4dzpuxm9h70p95d2dmcbwo4
+sudo docker compose \
+  --project-directory "$D" \
+  --env-file "$D/.env" \
+  -f "$D/docker-compose.yaml" \
+  up -d --force-recreate --no-deps sidecar
+```
+
+After recreation, `HostConfig.NetworkMode` referenced the new ReDroid ID, the sidecar became healthy, `0.0.0.0:8002` listened in the shared namespace, DW-fast-api's authenticated `/v1/captures` request succeeded, and a Flezen `file_details` flow was captured.

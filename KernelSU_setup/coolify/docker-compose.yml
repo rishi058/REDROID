@@ -6,6 +6,12 @@ services:
     # Android/Linux hostname and Docker DNS identities stable instead.
     hostname: redroid14-ksu
     privileged: true
+    # Isolate Android netd's cgroup/socket BPF program and UID permission map.
+    # This requires the host to boot with unified cgroup v2; private namespaces
+    # alone do not isolate the Android-created hierarchy on a cgroup-v1 host.
+    # Without both pieces, a second ReDroid can replace this instance's program
+    # and deny sockets for colliding app IDs (socket(AF_INET6, ...) = EPERM).
+    cgroup: private
     # Preserve service availability across Docker/Coolify and VPS restarts.
     # Resource and PID limits still contain a failed Android workload.
     # /data below preserves every module and app file. If a container-only

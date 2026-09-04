@@ -3,6 +3,9 @@ services:
     image: redroid/redroid@sha256:0a611199ba2e0b5d60af39b3327a517f6407231f4352114ed3bd3cbfe2be69aa
     hostname: redroid-experimental
     privileged: true
+    # On a unified-cgroup-v2 host, keep this instance's Android netd BPF program
+    # scoped to its own namespace so it cannot replace production's program.
+    cgroup: private
     restart: unless-stopped
     cpus: 1
     mem_limit: 4g

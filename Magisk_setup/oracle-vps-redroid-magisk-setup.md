@@ -505,7 +505,11 @@ debugging endpoint beyond the VPS.
 ### Two settings NOT in this file, on purpose
 
 - **No `init: true`.** Android's own `/init` is designed to run as **PID 1** (it reaps zombies and runs the property service itself). Docker's `init: true` inserts a `tini` shim as PID 1 and demotes Android init to PID 2, which can cause subtle issues. The official Redroid examples omit it, so we do too.
-- **No cgroup flags** (`cgroup: host`, `cgroupns_mode: host`). You don't need them (see the [cgroup myth](#14-the-cgroup-myth-read-this--it-saves-the-most-time)), and Coolify's schema rejects them anyway (see [Appendix D](#appendix-d--the-cgroup-rabbit-hole-what-not-to-do)).
+- **No host cgroup flags** (`cgroup: host`, `cgroupns_mode: host`) are needed
+  for this single Android 13 setup. This does not apply to multiple Android 14
+  ReDroid instances: those require a unified-cgroup-v2 host plus the supported
+  Compose service key `cgroup: private` to isolate netd BPF programs (see the
+  KernelSU Coolify guide and `network-fix.md`).
 
 ## Step 8 — Create a local SSH tunnel
 
@@ -753,7 +757,12 @@ Coolify enforces a whitelist of allowed Docker options. Its **Custom Docker Opti
 --device  --ulimit  --init  --privileged  --gpus  --entrypoint
 ```
 
-Anything else (notably `--cgroupns` and `--cgroup-parent`) is rejected by design. **You don't need those for Android 13** — but if you ever want to run outside Coolify's constraints entirely, drop to raw Docker. This also gives you a clean, reproducible way to test:
+Anything else (notably `--cgroupns` and `--cgroup-parent`) is rejected in the
+**Custom Docker Options** field. That does not mean the Compose service key
+`cgroup: private` is rejected: it was validated with Coolify 4.1.2 and Docker
+Compose 5.4.0. **You don't need it for this single Android 13 setup** — but if
+you want unsupported Docker CLI flags, drop to raw Docker. This also gives you
+a clean, reproducible way to test:
 
 ```bash
 docker rm -f a13_1 2>/dev/null || true
@@ -937,7 +946,7 @@ This section exists because the internet is full of "fixes" for the `cpuset cgro
 |---|---|
 | Forcing the host to cgroup v1 (`systemd.unified_cgroup_hierarchy=0`) + ripping out the Oracle kernel "because it strips cpuset" | Unnecessary. Android 13 boots on v2. This was the original misdiagnosis. |
 | `cgroupns_mode: host` in compose | Not a real compose key — correctly rejected. |
-| `cgroup: host` in compose | Real key, but Coolify's schema rejects it. Also not needed. |
+| `cgroup: host` in compose | Real key but wrong for multi-instance Android 14; use unified host cgroup v2 plus `cgroup: private`. Current Coolify accepts the Compose key, although its Custom Docker Options field rejects `--cgroupns`. |
 | `"default-cgroupns-mode": "host"` in `daemon.json` | On a cgroup-v1/hybrid host Docker *already* defaults cgroupns to `host`, so this changes nothing. (And it only affects freshly *created* containers, never a `restart`.) |
 | `mount --bind /sys/fs/cgroup/cpuset /dev/cpuset` inside the running container | Fails (read-only namespace) and pointless. |
 | Volume `- /sys/fs/cgroup/cpuset:/dev/cpuset` | No effect on the actual boot problem. |
