@@ -1,0 +1,95 @@
+services:
+  redroid:
+    # Keep the local-first stack on the official x86_64 Android 14 image.
+    image: ${REDROID_IMAGE:-redroid/redroid:14.0.0-latest}
+    platform: linux/amd64
+    hostname: redroid
+    privileged: true
+    restart: unless-stopped
+    cpus: ${REDROID_CPUS:-2}
+    mem_limit: ${REDROID_MEMORY_LIMIT:-6g}
+    memswap_limit: ${REDROID_SWAP_LIMIT:-7g}
+    pids_limit: 4096
+    stop_grace_period: 10s
+    ports:
+      - "127.0.0.1:${HOST_ADB_PORT:-5557}:5555"
+    volumes:
+      - redroid-data:/data
+      # A second BinderFS superblock prevents cross-instance Binder collisions.
+      - /dev/binderfs-unified:/dev/binderfs
+      - /dev/null:/dev/kmsg
+    command:
+      - androidboot.redroid_width=720
+      - androidboot.redroid_height=1280
+      - androidboot.redroid_dpi=320
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test "$$(getprop sys.boot_completed)" = "1" &&
+          test "$$(getprop init.svc.adbd)" = "running" &&
+          pidof adbd >/dev/null
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  device-controller:
+    build:
+      context: .
+      dockerfile: DockerFile
+    platform: linux/amd64
+    init: true
+    restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - .env
+    environment:
+      DEFAULT_ADB_SERIAL: redroid:5555
+      ADB_VENDOR_KEYS: /run/secrets
+      HOME: /tmp
+      SCRCPY_SERVER_PATH: /opt/scrcpy/scrcpy-server-v3.3.3
+      TOUCH_INJECTION_MODE: adb
+      ANDROID_DISPLAY_WIDTH: "720"
+      ANDROID_DISPLAY_HEIGHT: "1280"
+    secrets:
+      - source: adbkey
+        target: adbkey
+    volumes:
+      - controller-data:/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m,mode=1777
+    ports:
+      - "127.0.0.1:${CONTROLLER_PORT:-3003}:3003"
+    depends_on:
+      redroid:
+        condition: service_healthy
+    cpus: ${CONTROLLER_CPUS:-1}
+    mem_limit: ${CONTROLLER_MEMORY_LIMIT:-1g}
+    memswap_limit: ${CONTROLLER_SWAP_LIMIT:-1g}
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+secrets:
+  adbkey:
+    # This is the key already authorized by the existing local WSL ReDroid.
+    # Override ADB_VENDOR_KEY_FILE for a deployment-specific controller key.
+    file: ${ADB_VENDOR_KEY_FILE:-../DW-fast-api/adb-keys/adbkey}
+
+volumes:
+  redroid-data:
+  controller-data:

@@ -1,0 +1,27 @@
+{
+  "name": "device-controller-gui",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "npm run typecheck && npm run build:worker && vite build",
+    "build:worker": "tsc -p tsconfig.worker.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@yume-chan/adb": "2.6.4",
+    "@yume-chan/adb-server-node-tcp": "2.5.2",
+    "@yume-chan/adb-scrcpy": "2.3.2",
+    "@yume-chan/scrcpy": "2.3.0",
+    "@yume-chan/scrcpy-decoder-webcodecs": "2.5.3",
+    "@yume-chan/stream-extra": "2.6.1",
+    "@yume-chan/struct": "2.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3",
+    "vite": "7.2.2",
+    "vitest": "4.0.8"
+  }
+}

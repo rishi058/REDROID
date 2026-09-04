@@ -1,0 +1,69 @@
+# syntax=docker/dockerfile:1.7
+
+FROM node:22-bookworm-slim AS gui-builder
+
+WORKDIR /build/gui
+COPY gui/package.json gui/package-lock.json ./
+RUN npm ci
+COPY gui/ ./
+RUN npm run build && npm prune --omit=dev
+
+
+FROM debian:bookworm-slim AS scrcpy-server
+
+ARG SCRCPY_SERVER_VERSION=3.3.3
+ARG SCRCPY_SERVER_SHA256=7e70323ba7f259649dd4acce97ac4fefbae8102b2c6d91e2e7be613fd5354be0
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && curl --fail --location --retry 3 \
+       --output /scrcpy-server \
+       "https://github.com/Genymobile/scrcpy/releases/download/v${SCRCPY_SERVER_VERSION}/scrcpy-server-v${SCRCPY_SERVER_VERSION}" \
+    && echo "${SCRCPY_SERVER_SHA256}  /scrcpy-server" | sha256sum --check --strict \
+    && chmod 0444 /scrcpy-server
+
+
+FROM python:3.12-slim-bookworm
+
+ARG CONTROLLER_UID=10001
+ARG CONTROLLER_GID=10001
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       android-tools-adb \
+       ca-certificates \
+       libstdc++6 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid "${CONTROLLER_GID}" controller \
+    && useradd --uid "${CONTROLLER_UID}" --gid controller --no-create-home controller \
+    && mkdir -p /app /data /opt/scrcpy \
+    && chown -R controller:controller /app /data
+
+COPY --from=gui-builder /usr/local/bin/node /usr/local/bin/node
+
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --requirement requirements.txt
+
+COPY --chown=controller:controller . ./
+COPY --from=gui-builder --chown=controller:controller /build/gui/node_modules ./gui/node_modules
+COPY --from=gui-builder --chown=controller:controller /build/gui/worker/dist ./gui/worker/dist
+COPY --from=gui-builder --chown=controller:controller /build/gui/web/dist ./gui/web/dist
+COPY --from=scrcpy-server /scrcpy-server /opt/scrcpy/scrcpy-server-v3.3.3
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HOME=/tmp \
+    ADB_VENDOR_KEYS=/run/secrets \
+    SCRCPY_SERVER_PATH=/opt/scrcpy/scrcpy-server-v3.3.3 \
+    TOUCH_INJECTION_MODE=adb \
+    ANDROID_DISPLAY_WIDTH=720 \
+    ANDROID_DISPLAY_HEIGHT=1280 \
+    GUI_WORKER_COMMAND="node gui/worker/dist/index.js"
+
+USER controller
+EXPOSE 3003
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=4 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3003/healthz', timeout=4).read()"]
+
+CMD ["python", "main.py"]
