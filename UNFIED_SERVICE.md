@@ -22,6 +22,10 @@ target remains local x86_64 WSL; production VPS/ReDroid is outside this phase.
   under `device-controller/`.
 - GUI leases, strict-Origin WebSocket handling, a private Tango worker and a
   WebCodecs browser client are implemented structurally.
+- The browser client now uses the official shadcn Vite/Radix Nova workflow with
+  React 19 and Tailwind v4: responsive dark shell, Radix mobile Sheet navigation,
+  a thin 9:16 phone bezel, and an accessible bottom-right resize handle. Once
+  connected, only the top bar and fitted device remain in the 100dvh viewport.
 - The controller image builds successfully as `linux/amd64`; Python imports,
   Node runtime and the pinned scrcpy-server checksum were smoke-tested in WSL.
 - Local `.env` starts with `REQUIRE_API_KEYS=false`, explicitly confirms
