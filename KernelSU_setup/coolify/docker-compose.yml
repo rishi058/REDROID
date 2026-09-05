@@ -26,18 +26,14 @@ services:
       # The malware that previously occupied 5555 has been removed. Keep real
       # Android adbd on its standard ReDroid port for Docker/API reachability.
       # Public firewall restriction is intentionally deferred.
+      #
+      # This published port IS the API's path to ADB: dw-fast-api SSH-tunnels to
+      # the VPS host and connects to the host's own 127.0.0.1:5555. It replaced
+      # the old shared `redroid-persistent` bridge, on which the API addressed
+      # this container by the `redroid14` alias. That bridge is gone, so Android
+      # now boots with a single interface (the Coolify-injected network as eth0)
+      # and the dual-network attachment race in network-fix.md cannot occur.
       - "5555:5555"
-    networks:
-      redroid-persistent:
-        # Coolify injects its NAT-capable per-service network separately. Pin
-        # this auxiliary bridge to eth1 and give it a lower gateway priority so
-        # Android always boots the Coolify endpoint as eth0. This also avoids
-        # the dual-network attachment race documented in network-fix.md.
-        interface_name: eth1
-        gw_priority: -1
-        aliases:
-          - redroid14
-          - redroid14-ksu
     volumes:
       # The host preparation script creates these BinderFS nodes before deployment.
       - /dev/binderfs/binder:/dev/binder
@@ -81,10 +77,3 @@ services:
       - service.adb.tcp.port=5555
       - ro.secure=0
       - ro.debuggable=1
-
-networks:
-  redroid-persistent:
-    # Created once on the VPS. As an external network, Coolify/Compose cannot
-    # rename or delete it during force-recreate deployments.
-    external: true
-    name: redroid-persistent

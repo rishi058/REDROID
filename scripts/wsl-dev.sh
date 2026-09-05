@@ -182,7 +182,6 @@ run_api() {
     # No tunnels: the device is local. Without these the committed .env can send
     # this at the production VPS and force-stop the live app.
     export FLEZEN_USE_SSH_TUNNEL=false
-    export DEV_MODE=false
     export USE_SSH_TUNNEL=false
     export VPS_HOST=""
     # WSL's adb has its OWN ~/.android/adbkey, which the device has never seen --

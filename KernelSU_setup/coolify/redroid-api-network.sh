@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 set -u
 
-# Persist FastAPI's Redroid network attachment and recover stale/offline ADB
-# transports without restarting the Redroid container. Container-only Redroid
-# restarts break KernelSU/LSPosed and are intentionally not used for ADB repair.
+# Recover the FastAPI container's ADB transport to Redroid without restarting
+# the Redroid container. Container-only Redroid restarts break KernelSU/LSPosed
+# and are intentionally not used for ADB repair.
+#
+# The API reaches Redroid over its own in-container SSH tunnel to the VPS host
+# loopback (USE_SSH_TUNNEL=true), so the transport it uses is ADB_SERIAL below —
+# NOT a Docker service name on a shared bridge. Probing any other serial reports
+# a permanent false outage and makes this daemon restart adbd underneath live
+# captures, so ADB_SERIAL must stay in sync with the API's DEFAULT_ADB_SERIAL.
 
 APPLICATION_ID=14
-NETWORK=redroid-persistent
-ADB_SERIAL=redroid14:5555
+REDROID_SERVICE=redroid14
+ADB_SERIAL=127.0.0.1:5555
 HEALTH_INTERVAL=30
 OFFLINE_THRESHOLD=2
 RECOVERY_COOLDOWN=300
@@ -68,32 +74,6 @@ connect_api_transport() {
   [ "$(adb_state "$container")" = device ]
 }
 
-ensure_container_network() {
-  local container=$1 redroid redroid_ip
-
-  if ! docker inspect "$container" \
-      --format '{{json .NetworkSettings.Networks}}' | grep -q '"redroid-persistent"'; then
-    docker network connect --alias dw-fast-api "$NETWORK" "$container" || return 1
-    log "Attached API container $container to $NETWORK"
-  else
-    log "API container $container is already attached to $NETWORK"
-  fi
-
-  redroid=$(docker ps -q --filter 'label=coolify.serviceName=redroid14' | head -n 1)
-  [ -n "$redroid" ] || return 1
-  redroid_ip=$(docker inspect "$redroid" --format \
-    '{{with index .NetworkSettings.Networks "redroid-persistent"}}{{.IPAddress}}{{end}}')
-  [ -n "$redroid_ip" ] || return 1
-
-  if ! docker exec "$container" grep -qE \
-      "^${redroid_ip}[[:space:]]+redroid14([[:space:]]|$)" /etc/hosts; then
-    docker exec "$container" sh -c \
-      "awk '!/(^|[[:space:]])redroid14([[:space:]]|$)/' /etc/hosts > /tmp/hosts.redroid && cat /tmp/hosts.redroid > /etc/hosts && rm -f /tmp/hosts.redroid && echo '${redroid_ip} redroid14 redroid14-ksu' >> /etc/hosts" \
-      || return 1
-    log "Mapped redroid14 to production container $redroid_ip on $NETWORK"
-  fi
-}
-
 recover_adb() {
   local container=$1 redroid
 
@@ -105,7 +85,7 @@ recover_adb() {
     return 0
   fi
 
-  redroid=$(docker ps -q --filter 'label=coolify.serviceName=redroid14' | head -n 1)
+  redroid=$(docker ps -q --filter "label=coolify.serviceName=$REDROID_SERVICE" | head -n 1)
   [ -n "$redroid" ] || return 1
 
   log "API-side reset failed; restarting only Android adbd (not the container)"
@@ -136,11 +116,6 @@ while sleep 5; do
   start_key="$container@$started"
 
   if [ "$start_key" != "$last_start" ]; then
-    if ! ensure_container_network "$container"; then
-      log "Failed to prepare API networking for $container"
-      sleep 10
-      continue
-    fi
     if wait_for_api "$container" && api_connect "$container"; then
       log "API connected to $ADB_SERIAL successfully"
     else
@@ -153,11 +128,6 @@ while sleep 5; do
   now=$(date +%s)
   [ $((now - last_health)) -ge "$HEALTH_INTERVAL" ] || continue
   last_health=$now
-
-  if ! ensure_container_network "$container"; then
-    log "Failed to refresh production ReDroid network identity"
-    continue
-  fi
 
   state=$(adb_state "$container")
   if [ "$state" = device ]; then
