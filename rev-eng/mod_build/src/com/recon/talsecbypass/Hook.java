@@ -6,8 +6,14 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 import java.util.Iterator;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.Set;
+import java.util.WeakHashMap;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 /* Targeted freeRASP/Talsec reaction guard for com.target-appapp.
    The app obfuscated the freeRASP SDK, so generic unrasp couldn't hook it. The
@@ -63,12 +69,34 @@ public class Hook implements IXposedHookLoadPackage {
     // real cache when available; never fabricate an entitlement or customer.
     private static final boolean USE_CACHED_REVENUECAT_CUSTOMER_INFO = true;
 
+    // ── AppLovin MAX resource containment ────────────────────────────────────
+    // Diskwala's global AdProvider reloads the same full-screen ad units after
+    // hide/failure with no backoff. Every reload fans into the installed MAX
+    // mediation adapters, which have been observed creating hundreds of
+    // long-lived executor threads in one app process. Keep the first load and
+    // permit a periodic refresh, but suppress hot-loop reloads at the narrow RN
+    // bridge boundary. Endpoint reachability/ad-block checks remain untouched.
+    private static final boolean LIMIT_APPLOVIN_RELOADS = true;
+    private static final boolean DISABLE_APPLOVIN_AUTO_REFRESH = true;
+    private static final long APPLOVIN_LOAD_COOLDOWN_MS = 10L * 60L * 1000L;
+    private static final long BIDMACHINE_IDLE_THREAD_TIMEOUT_SECONDS = 30L;
+
     // ── mutable state ────────────────────────────────────────────────────────
     private static boolean loggedAppiCryptCheckSchema = false;
     // Accumulates every native threat name that fires after process start.
     // Emitted alongside the FNatives.z return so we can correlate what the
     // native signer "saw" with whether the server accepted the cryptogram.
     private static final Set<String> firedThreats = new LinkedHashSet<>();
+    private static final Object firedThreatsLock = new Object();
+    private static final Object appLovinLoadLock = new Object();
+    private static final Map<String, Long> appLovinLastAllowedLoad = new LinkedHashMap<>();
+    private static final Map<String, Integer> appLovinSuppressedLoads = new LinkedHashMap<>();
+    private static boolean loggedAutoRefreshBlock = false;
+    private static final Object bidMachinePoolLock = new Object();
+    private static int bidMachinePoolsConfigured = 0;
+    private static final Set<ScheduledThreadPoolExecutor> configuredBidMachinePools =
+        Collections.newSetFromMap(new WeakHashMap<ScheduledThreadPoolExecutor, Boolean>());
+    private static final Map<String, Integer> scheduledPoolOwnerCounts = new LinkedHashMap<>();
 
     // ────────────────────────────────────────────────────────────────────────
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) throws Throwable {
@@ -131,6 +159,8 @@ public class Hook implements IXposedHookLoadPackage {
         if (USE_CACHED_REVENUECAT_CUSTOMER_INFO) {
             hookCachedRevenueCatCustomerInfo(cl);
         }
+        hookAppLovinResourceGuards(cl);
+        hookBidMachineExecutorContainment(cl);
 
         // 1) Keep native freeRASP/AppiCrypt initialization enabled by default.
         //    The old no-op is retained behind an explicit diagnostic switch so
@@ -259,6 +289,201 @@ public class Hook implements IXposedHookLoadPackage {
         XposedBridge.log(TAG + "reaction guards installed (native RASP active, threat channel desynced)");
     }
 
+    // ── AppLovin MAX resource containment ───────────────────────────────────
+    private void hookAppLovinResourceGuards(final ClassLoader cl) {
+        if (LIMIT_APPLOVIN_RELOADS) {
+            hookAppLovinLoadMethod(cl, "loadInterstitial", "interstitial");
+            hookAppLovinLoadMethod(cl, "loadRewardedAd", "rewarded");
+        }
+
+        if (DISABLE_APPLOVIN_AUTO_REFRESH) {
+            try {
+                XposedHelpers.findAndHookMethod(
+                    "com.applovin.reactnative.AppLovinMAXAdView", cl,
+                    "setAutoRefreshEnabled", boolean.class,
+                    new XC_MethodHook() {
+                        protected void beforeHookedMethod(MethodHookParam p) {
+                            if (!Boolean.TRUE.equals(p.args[0])) return;
+                            p.args[0] = false;
+                            synchronized (appLovinLoadLock) {
+                                if (!loggedAutoRefreshBlock) {
+                                    loggedAutoRefreshBlock = true;
+                                    XposedBridge.log(TAG
+                                        + "AppLovin banner/MREC auto-refresh disabled; initial load preserved");
+                                }
+                            }
+                        }
+                    });
+                XposedBridge.log(TAG + "AppLovin auto-refresh guard installed");
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + "AppLovin auto-refresh hook note: " + t);
+            }
+        }
+    }
+
+    private void hookAppLovinLoadMethod(final ClassLoader cl, final String method,
+                                        final String format) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                "com.applovin.reactnative.AppLovinMAXModuleImpl", cl,
+                method, String.class, new XC_MethodHook() {
+                    protected void beforeHookedMethod(MethodHookParam p) {
+                        String adUnitId = p.args[0] instanceof String
+                            ? (String) p.args[0] : null;
+                        if (adUnitId == null || adUnitId.isEmpty()) return;
+
+                        String key = format + ":" + adUnitId;
+                        long now = System.nanoTime() / 1_000_000L;
+                        long remaining;
+                        int suppressed;
+                        synchronized (appLovinLoadLock) {
+                            Long last = appLovinLastAllowedLoad.get(key);
+                            if (last == null || now - last.longValue() >= APPLOVIN_LOAD_COOLDOWN_MS) {
+                                appLovinLastAllowedLoad.put(key, Long.valueOf(now));
+                                appLovinSuppressedLoads.put(key, Integer.valueOf(0));
+                                XposedBridge.log(TAG + "AppLovin " + format
+                                    + " load allowed unit=" + unitFingerprint(adUnitId));
+                                return;
+                            }
+
+                            remaining = APPLOVIN_LOAD_COOLDOWN_MS - (now - last.longValue());
+                            suppressed = appLovinSuppressedLoads.containsKey(key)
+                                ? appLovinSuppressedLoads.get(key).intValue() + 1 : 1;
+                            appLovinSuppressedLoads.put(key, Integer.valueOf(suppressed));
+                        }
+
+                        // The native bridge method is void. Returning null drops
+                        // only this duplicate load request; readiness/event APIs,
+                        // SDK initialization, and Diskwala networking remain real.
+                        p.setResult(null);
+                        if (suppressed == 1 || suppressed % 25 == 0) {
+                            XposedBridge.log(TAG + "AppLovin " + format
+                                + " reload suppressed unit=" + unitFingerprint(adUnitId)
+                                + " count=" + suppressed
+                                + " retryInSec=" + ((remaining + 999L) / 1000L));
+                        }
+                    }
+                });
+            XposedBridge.log(TAG + "AppLovin " + method + " limiter installed");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "AppLovin " + method + " hook FAILED: " + t);
+        }
+    }
+
+    // ART dumps showed hundreds of default-named workers owned by BidMachine's
+    // GAMTaskLoader. Every loader creates a 2–4 core scheduled executor, submits
+    // only immediate work, and never shuts it down. Keep all executor/task
+    // semantics, but allow idle core workers to retire and be recreated later.
+    private void hookBidMachineExecutorContainment(final ClassLoader cl) {
+        try {
+            // Constructor-level interception reliably sees the executor before
+            // Executors.newScheduledThreadPool() returns it to GAMTaskLoader.
+            // Every scheduled pool is observed, but mutation is restricted to
+            // the exact verified BidMachine construction stack.
+            XposedBridge.hookAllConstructors(
+                ScheduledThreadPoolExecutor.class, new XC_MethodHook() {
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        String owner = scheduledExecutorOwner();
+                        logScheduledPoolOwner(owner);
+                        if (!owner.startsWith(
+                                "io.bidmachine.ads.networks.gam.GAMLoader$GAMTaskLoader#")) {
+                            return;
+                        }
+                        configureBidMachineExecutor(
+                            (ScheduledThreadPoolExecutor) p.thisObject, "constructor-stack");
+                    }
+                });
+            XposedBridge.log(TAG + "scheduled-executor owner probe installed");
+
+            // Keep the owner after-hook as a narrow fallback on versions where
+            // boot-class constructor hooks are restricted by the runtime.
+            Class<?> taskLoader = XposedHelpers.findClass(
+                "io.bidmachine.ads.networks.gam.GAMLoader$GAMTaskLoader", cl);
+            XposedBridge.hookAllConstructors(taskLoader, new XC_MethodHook() {
+                protected void afterHookedMethod(MethodHookParam p) {
+                    try {
+                        Object value = XposedHelpers.getObjectField(
+                            p.thisObject, "executorService");
+                        if (!(value instanceof ScheduledThreadPoolExecutor)) {
+                            XposedBridge.log(TAG
+                                + "BidMachine GAM executor guard skipped unexpected type="
+                                + (value == null ? "null" : value.getClass().getName()));
+                            return;
+                        }
+
+                        configureBidMachineExecutor(
+                            (ScheduledThreadPoolExecutor) value, "owner-after-hook");
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + "BidMachine GAM executor guard note: " + t);
+                    }
+                }
+            });
+            XposedBridge.log(TAG + "BidMachine GAM executor guard installed");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "BidMachine GAM executor hook FAILED: " + t);
+        }
+    }
+
+    private static void configureBidMachineExecutor(ScheduledThreadPoolExecutor executor,
+                                                     String source) {
+        int configured;
+        synchronized (bidMachinePoolLock) {
+            if (!configuredBidMachinePools.add(executor)) return;
+            configured = ++bidMachinePoolsConfigured;
+        }
+        executor.setKeepAliveTime(
+            BIDMACHINE_IDLE_THREAD_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        executor.allowCoreThreadTimeOut(true);
+        executor.setRemoveOnCancelPolicy(true);
+        if (configured <= 3 || configured % 50 == 0) {
+            XposedBridge.log(TAG
+                + "BidMachine GAM idle-core timeout configured pools=" + configured
+                + " core=" + executor.getCorePoolSize()
+                + " timeoutSec=" + BIDMACHINE_IDLE_THREAD_TIMEOUT_SECONDS
+                + " source=" + source);
+        }
+    }
+
+    private static String scheduledExecutorOwner() {
+        StackTraceElement[] stack = Thread.currentThread().getStackTrace();
+        String fallback = "unknown";
+        for (StackTraceElement frame : stack) {
+            String name = frame.getClassName();
+            if (name.equals(
+                    "io.bidmachine.ads.networks.gam.GAMLoader$GAMTaskLoader")) {
+                return name + "#" + frame.getMethodName();
+            }
+            if (name.startsWith("java.") || name.startsWith("android.")
+                    || name.startsWith("dalvik.") || name.startsWith("de.robv.")
+                    || name.startsWith("org.lsposed.")
+                    || name.startsWith("com.recon.talsecbypass.")
+                    || name.contains("XposedBridge")
+                    || name.contains("XposedHelpers")
+                    || name.contains("XC_MethodHook")) {
+                continue;
+            }
+            if ("unknown".equals(fallback)) {
+                fallback = name + "#" + frame.getMethodName();
+            }
+        }
+        return fallback;
+    }
+
+    private static void logScheduledPoolOwner(String owner) {
+        int observed;
+        synchronized (bidMachinePoolLock) {
+            Integer prior = scheduledPoolOwnerCounts.get(owner);
+            observed = prior == null ? 1 : prior.intValue() + 1;
+            if (prior != null || scheduledPoolOwnerCounts.size() < 100) {
+                scheduledPoolOwnerCounts.put(owner, Integer.valueOf(observed));
+            }
+        }
+        if (observed == 1 || observed % 50 == 0) {
+            XposedBridge.log(TAG + "scheduled executor owner=" + owner
+                + " count=" + observed);
+        }
+    }
+
     // ── process-kill guard ───────────────────────────────────────────────────
     private void hookSelfSigkill(final ClassLoader cl, final String method,
                                  final boolean explicitSignal) {
@@ -303,7 +528,9 @@ public class Hook implements IXposedHookLoadPackage {
         try {
             XposedHelpers.findAndHookMethod(className, cl, method, new XC_MethodHook() {
                 protected void beforeHookedMethod(MethodHookParam p) {
-                    firedThreats.add(threatName);
+                    synchronized (firedThreatsLock) {
+                        firedThreats.add(threatName);
+                    }
                     XposedBridge.log(TAG + "native threat detected: " + threatName);
                 }
             });
@@ -679,14 +906,20 @@ public class Hook implements IXposedHookLoadPackage {
         return value == null ? -1 : value.length;
     }
 
+    private static String unitFingerprint(String adUnitId) {
+        return Integer.toHexString(adUnitId.hashCode());
+    }
+
     private static String joinThreats() {
-        if (firedThreats.isEmpty()) return "none";
-        StringBuilder sb = new StringBuilder();
-        for (String t : firedThreats) {
-            if (sb.length() > 0) sb.append(',');
-            sb.append(t);
+        synchronized (firedThreatsLock) {
+            if (firedThreats.isEmpty()) return "none";
+            StringBuilder sb = new StringBuilder();
+            for (String t : firedThreats) {
+                if (sb.length() > 0) sb.append(',');
+                sb.append(t);
+            }
+            return sb.toString();
         }
-        return sb.toString();
     }
 
     // Mutate the AppiCrypt checks JSON before the native signer serialises it.

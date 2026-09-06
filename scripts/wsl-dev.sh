@@ -175,7 +175,6 @@ run_api() {
     sync_code
     local ip; ip="$(netns_ip)"
 
-    export FLEZEN_CAPTURE_BACKEND=sidecar
     export FLEZEN_SIDECAR_URL="http://$ip:${FLEZENCAP_API_PORT:-8002}"
     export FLEZEN_SIDECAR_KEY="$KEY"
     export FLEZEN_ADB_SERIAL="127.0.0.1:5555"

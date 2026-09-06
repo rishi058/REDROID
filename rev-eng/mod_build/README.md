@@ -167,14 +167,60 @@ The normal configuration applies only these reaction/stability guards:
    path are stopped.
 6. JavaScript receives dead threat-event channel names so the insecure-device
    screen does not take over the task.
+7. AppLovin MAX interstitial and rewarded-ad reloads are limited per ad unit to
+   one permitted load every 10 minutes. The initial load, MAX initialization,
+   readiness/event APIs, ad-endpoint reachability checks, and Diskwala network
+   requests remain real.
+8. Banner and MREC auto-refresh requests are rewritten from enabled to disabled;
+   their initial mount load remains enabled.
+9. An experimental BidMachine GAM guard can make a positively attributed loader
+   executor's idle core workers expire after 30 seconds. Production v1.3 has not
+   produced a configured-pool log, so this timeout must currently be treated as
+   inactive.
 
 Expected normal log lines include:
 
 ```text
 [TalsecKill] registerListeners left active (native RASP starts normally)
 [TalsecKill] FNatives.x native self-kill guard installed
+[TalsecKill] AppLovin loadInterstitial limiter installed
+[TalsecKill] AppLovin loadRewardedAd limiter installed
+[TalsecKill] AppLovin auto-refresh guard installed
+[TalsecKill] BidMachine GAM executor guard installed
 [TalsecKill] reaction guards installed (native RASP active, threat channel desynced)
 ```
+
+### AppLovin resource containment
+
+Production profiling showed that repeated full-screen ad reloads fan out into
+the installed MAX mediation adapters and leave hundreds of long-lived executor
+threads in the Diskwala process. The limiter is installed at the narrow React
+Native bridge (`AppLovinMAXModuleImpl`) rather than hooking adapter internals,
+generic executors, `Thread.start`, or networking.
+
+The first `loadInterstitial`/`loadRewardedAd` call for each ad unit is allowed.
+Further calls inside the 10-minute monotonic cooldown return from the bridge's
+void method without fabricating loaded/failed events. Suppression logs contain
+only a hash fingerprint of the ad unit and are sampled at the first and every
+25th suppressed call. This does not interfere with the app's independent
+ad-block reachability checks or the `/android/np_lelo` and
+`/android/playlist_items` capture requests.
+
+After installing this module update, repair LSPosed's cached APK path, reboot
+the complete host, and validate both capture types before production traffic.
+Compare fresh-process thread count and RSS against an unmodified run. If a
+future AppLovin bridge class changes, the hook logs a failure and leaves the
+original SDK behavior intact.
+
+ART thread-dump analysis identified BidMachine's `GAMLoader$GAMTaskLoader` as a
+strong source match for the dominant anonymous scheduled pools. Each loader
+creates a 2–4 core scheduled executor, submits only immediate work, and has no
+shutdown path. The module is designed to keep the executor and submitted work
+intact while enabling a 30-second idle-core timeout only after exact owner
+attribution. In the production v1.3 A/B, the direct owner hook did not fire and
+generic constructor telemetry saw only `LSPHooker_#constructor`; no timeout was
+observed applying. Do not claim this guard is active without a
+`BidMachine GAM idle-core timeout configured` log.
 
 The earlier promise wrapper that logged vault values and cryptograms, including
 its secret-priming helper, has been removed from source. The module must never
@@ -216,23 +262,33 @@ Build from the repository root in PowerShell:
 & 'C:\Program Files\Git\bin\bash.exe' rev-eng/mod_build/build_module.sh
 ```
 
-Then install, scope, and restart the KernelSU/ReDroid host so LSPosed loads the
-new module into a fresh app process:
+Do not run `scope_talseckill.sh` through an unprivileged ADB shell. The deployed
+Android `sqlite3` is ABI-broken, and LSPosed's live WAL must not be edited in
+place. Use the vetted host-side workflow documented in
+`DW-fast-api/TALSEC_v1.3.md`:
 
-```powershell
-adb install -r rev-eng/modules/talseckill.apk
-adb push rev-eng/mod_build/scope_talseckill.sh /data/local/tmp/scope_talseckill.sh
-adb shell 'chmod 700 /data/local/tmp/scope_talseckill.sh && sh /data/local/tmp/scope_talseckill.sh'
-ssh oracle_ubuntu_xpipe 'sudo systemctl reboot'
-```
+1. Back up the installed module APK and complete LSPosed config directory.
+2. Install the signed APK through the ReDroid container's root `pm`.
+3. Resolve the new randomized `pm path`.
+4. `SIGSTOP` `lspd`, copy the complete config directory to the VPS host, and set
+   an EXIT/error trap that always sends `SIGCONT`.
+5. Run `patch_lspd.py` against the copied DB, checkpoint its WAL, require
+   `PRAGMA integrity_check = ok`, and verify the module path/scope.
+6. Copy the verified main DB back, remove stale device-side WAL/SHM, and restore
+   root ownership/mode.
+7. On any failed copy/patch/check, resume `lspd` before aborting. Leave it stopped
+   only after all verification succeeds and the full VPS reboot is the immediate
+   next command.
+8. Reboot the full host so LSPosed/Zygote loads the new module into a fresh app
+   process.
 
 ## Verification checklist
 
 After the host and Android boot finish:
 
 1. Check the module package is installed: `adb shell pm path com.recon.talsecbypass`.
-2. Run the scope script again if needed and confirm its printed database rows
-   show the module enabled and scoped to `com.target-appapp` only.
+2. Verify a read-only host copy of the LSPosed DB shows the module enabled, its
+   current randomized APK path, and scope `com.diskwalaapp,user_id=0`.
 3. Launch target-app and inspect LSPosed logs for the `FNatives.x` guard-install
    and block messages above.
 4. Confirm the same target-app PID remains in the foreground beyond the former

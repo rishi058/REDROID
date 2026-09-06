@@ -12,7 +12,7 @@ Why a host-side patcher is needed on ReDroid + KernelSU:
      read /data/adb, so it cannot reach the DB either.
 The workflow that avoids both problems (run from the VPS host):
      sudo docker cp <ctr>:/data/adb/lspd/config/modules_config.db /tmp/db
-     sudo python3 patch_lspd.py /tmp/db com.recon.talsecbypass com.target-appapp "<apk_path>"
+     sudo python3 patch_lspd.py /tmp/db com.recon.talsecbypass com.diskwalaapp "<apk_path>"
      sudo docker cp /tmp/db <ctr>:/data/adb/lspd/config/modules_config.db
      # then remove the container's stale -wal/-shm sidecars and reboot the host
 
@@ -24,7 +24,7 @@ consistent file; leaving old sidecars beside it makes SQLite refuse writes.
 Arguments:
   db_path      path to the (copied-out) modules_config.db
   module_pkg   LSPosed module package    (com.recon.talsecbypass)
-  target_pkg   app to scope the module to (com.target-appapp placeholder)
+  target_pkg   app to scope the module to (com.diskwalaapp)
   apk_path     current on-device APK path (from `pm path <module_pkg>`)
 
 Idempotent: safe to re-run. Inserts a module row if none exists, updates
@@ -38,7 +38,7 @@ import sys
 
 db_path   = sys.argv[1]
 mod_pkg   = sys.argv[2]   # com.recon.talsecbypass
-target    = sys.argv[3]   # com.target-appapp
+target    = sys.argv[3]   # com.diskwalaapp
 apk_path  = sys.argv[4]   # from pm path
 
 con = sqlite3.connect(db_path)
@@ -74,6 +74,17 @@ else:
     print(f"scope already exists: {target}")
 
 con.commit()
+
+# Force the committed WAL contents into the main database before it is copied
+# back into the stopped LSPosed instance. This keeps the replacement independent
+# of stale device-side -wal/-shm files.
+cur.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+print("wal checkpoint:", cur.fetchone())
+cur.execute("PRAGMA integrity_check")
+integrity = cur.fetchone()[0]
+print("integrity:", integrity)
+if integrity != "ok":
+    raise SystemExit(f"LSPosed DB integrity check failed: {integrity}")
 
 # Verify
 cur.execute("SELECT mid, enabled, apk_path FROM modules WHERE module_pkg_name=?", (mod_pkg,))

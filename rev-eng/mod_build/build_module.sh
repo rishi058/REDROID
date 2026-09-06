@@ -5,13 +5,13 @@ AJAR="$SDK/platforms/android-35/android.jar"
 BT="$SDK/build-tools/35.0.1"
 cd "$(dirname "$0")"
 cleanup() {
-  rm -rf classes dexout generated-src base.apk classes.dex mod.apk talseckill-aligned.apk
+  rm -rf classes dexout generated-src generated-AndroidManifest.xml base.apk classes.dex mod.apk talseckill-aligned.apk
 }
 trap cleanup EXIT
-rm -rf classes dexout generated-src base.apk mod.apk talseckill-aligned.apk
+rm -rf classes dexout generated-src generated-AndroidManifest.xml base.apk mod.apk talseckill-aligned.apk
 mkdir -p classes dexout generated-src/com/recon/talsecbypass
 
-TARGET_APP_PACKAGE="${TARGET_APP_PACKAGE:-com.target-appapp}"
+TARGET_APP_PACKAGE="${TARGET_APP_PACKAGE:-com.diskwalaapp}"
 ACCEPTED_DEVICE_ID="${ACCEPTED_DEVICE_ID:-accepted-device-id}"
 case "$TARGET_APP_PACKAGE" in
   *[!A-Za-z0-9._]*|'') echo "invalid TARGET_APP_PACKAGE: $TARGET_APP_PACKAGE" >&2; exit 2 ;;
@@ -23,6 +23,8 @@ sed -e "s/com\.target-appapp/$TARGET_APP_PACKAGE/g" \
   -e "s/accepted-device-id/$ACCEPTED_DEVICE_ID/g" \
   src/com/recon/talsecbypass/Hook.java \
   > generated-src/com/recon/talsecbypass/Hook.java
+sed -e "s/com\.target-appapp/$TARGET_APP_PACKAGE/g" \
+  AndroidManifest.xml > generated-AndroidManifest.xml
 
 echo "[1/6] javac"
 javac --release 11 -cp "xposed-api.jar" -d classes generated-src/com/recon/talsecbypass/Hook.java
@@ -32,7 +34,7 @@ echo "[2/6] d8 -> classes.dex"
 ls -la dexout/classes.dex
 
 echo "[3/6] aapt2 link (manifest)"
-"$BT/aapt2.exe" link -o base.apk -I "$AJAR" --manifest AndroidManifest.xml --min-sdk-version 21 --target-sdk-version 35
+"$BT/aapt2.exe" link -o base.apk -I "$AJAR" --manifest generated-AndroidManifest.xml --min-sdk-version 21 --target-sdk-version 35
 
 echo "[4/6] add classes.dex + assets/xposed_init"
 cp dexout/classes.dex classes.dex

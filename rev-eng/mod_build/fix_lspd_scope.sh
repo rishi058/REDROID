@@ -27,17 +27,16 @@
 # an ABI-broken /system/bin/sqlite3 that core-dumps ("Aborted"); when that
 # happens, use patch_lspd.py from the host instead.
 #
-# TARGET uses the com.target-appapp placeholder (same convention as
-# scope_talseckill.sh / Hook.java); build_module.sh substitutes the real package
-# at deploy time. A Zygote restart (host reboot) is still required afterwards for
-# LSPosed to load the module into a fresh process.
+# TARGET defaults to Diskwala and can be overridden with TARGET_APP_PACKAGE for
+# another authorised target. A Zygote restart (host reboot) is still required
+# afterwards for LSPosed to load the module into a fresh process.
 #
 # Usage (on device):   sh fix_lspd_scope.sh
 set -e
 
 DB=/data/adb/lspd/config/modules_config.db
 PKG=com.recon.talsecbypass
-TARGET=com.target-appapp
+TARGET=${TARGET_APP_PACKAGE:-com.diskwalaapp}
 
 echo "[fix_lspd] resolving apk path..."
 NEW_PATH=$(pm path "$PKG" | sed 's/package://')
