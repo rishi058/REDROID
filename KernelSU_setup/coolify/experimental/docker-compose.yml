@@ -6,7 +6,9 @@ services:
     # On a unified-cgroup-v2 host, keep this instance's Android netd BPF program
     # scoped to its own namespace so it cannot replace production's program.
     cgroup: private
-    restart: unless-stopped
+    # Do not let dockerd boot this Android instance concurrently with its peers.
+    # redroid-sequential-start.service starts it after redroid14 and redroid14-v2.
+    restart: "no"
     cpus: 1
     mem_limit: 4g
     memswap_limit: 5g

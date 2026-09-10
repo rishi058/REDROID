@@ -3,7 +3,8 @@ services:
     image: 'redroid/redroid@sha256:0a611199ba2e0b5d60af39b3327a517f6407231f4352114ed3bd3cbfe2be69aa'
     hostname: redroid-experimental
     privileged: true
-    restart: unless-stopped
+    # Started in order by redroid-sequential-start.service after host reboot.
+    restart: "no"
     cpus: 0.5
     mem_limit: 4g
     memswap_limit: 5g
@@ -11,11 +12,6 @@ services:
     stop_grace_period: 10s
     ports:
       - '127.0.0.1:5557:5555'
-    networks:
-      redroid-persistent:
-        aliases:
-          - redroid-experimental
-      bk6ojzx98y1dlabu4d63c6d3: null
     volumes:
       - '/dev/binderfs-experimental/binder:/dev/binder'
       - '/dev/binderfs-experimental/hwbinder:/dev/hwbinder'
@@ -67,10 +63,3 @@ services:
       SERVICE_NAME_REDROID_EXPERIMENTAL: redroid-experimental
     env_file:
       - .env
-networks:
-  redroid-persistent:
-    external: true
-    name: redroid-persistent
-  bk6ojzx98y1dlabu4d63c6d3:
-    name: bk6ojzx98y1dlabu4d63c6d3
-    external: true

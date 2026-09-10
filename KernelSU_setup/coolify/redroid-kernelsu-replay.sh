@@ -3,13 +3,15 @@ set -u
 
 # KernelSU/Zygisk/LSPosed are initialized by the host kernel boot path. A
 # container-only Coolify restart preserves /data but cannot reliably recreate
-# LSPosed's daemon/injection state. Detect that condition per ReDroid service and
-# perform one guarded host reboot, which is the tested recovery path.
+# LSPosed's daemon/injection state. Concurrent Android boots can also leave an
+# lspd process without completing the system-server Binder handshake. Detect
+# either condition and perform one guarded host reboot.
 
 STATE_DIR=/var/lib/redroid-kernelsu-replay
 SERVICES=(
   "redroid14|coolify.serviceName=redroid14|redroid14-ksu|production"
-  "redroid-experimental|coolify.serviceName=redroid-experimental|redroid-experimental|experimental"
+  "redroid14-v2|coolify.serviceName=redroid14-v2|redroid14-v2|production"
+  "redroid-experimental|coolify.serviceName=redroid-experimental|redroid-experimental|production"
 )
 declare -A last_starts
 
@@ -26,6 +28,28 @@ is_running() {
   [ "$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null || true)" = true ]
 }
 
+has_current_lsposed_bridge() {
+  local container=$1
+  local started_epoch
+  local log_epoch
+  local log_path
+  local lspd_uid
+
+  lspd_uid=$(docker exec "$container" sh -c \
+    'p=$(pidof lspd 2>/dev/null | cut -d " " -f1); [ -n "$p" ] && stat -c %u "/proc/$p"' \
+    2>/dev/null || true)
+  [ "$lspd_uid" = 1000 ] || return 1
+
+  started_epoch=$(date -d "$(docker inspect --format '{{.State.StartedAt}}' "$container")" +%s) || return 1
+  read -r log_epoch log_path < <(docker exec "$container" sh -c \
+    'f=$(ls -t /data/adb/lspd/log/modules_* 2>/dev/null | head -n 1); [ -n "$f" ] && printf "%s %s\n" "$(stat -c %Y "$f")" "$f"' \
+    2>/dev/null || true) || true
+
+  [[ "${log_epoch:-}" =~ ^[0-9]+$ ]] \
+    && [ "$log_epoch" -ge "$started_epoch" ] \
+    && docker exec "$container" grep -q "LSPosed-Bridge.*binder received" "$log_path"
+}
+
 is_healthy() {
   local container=$1
   local service_type=$2
@@ -36,7 +60,7 @@ is_healthy() {
   docker exec "$container" /data/adb/ksud -V >/dev/null 2>&1 \
     && [[ "$modules" == *'"id": "zygisksu"'* ]] \
     && [[ "$modules" == *'"id": "zygisk_lsposed"'* ]] \
-    && docker exec "$container" sh -c 'ps -A | grep -Eq "(^|[[:space:]])lspd([[:space:]]|$)"' \
+    && has_current_lsposed_bridge "$container" \
     && docker exec "$container" pm path com.google.android.gsf >/dev/null 2>&1 \
     && docker exec "$container" pm path com.google.android.gms >/dev/null 2>&1 \
     && docker exec "$container" pm path com.android.vending >/dev/null 2>&1 \
@@ -72,7 +96,7 @@ while sleep 5; do
     docker exec "$container" hostname "$hostname" || true
 
     # LSPosed can appear shortly after Android reports boot completion.
-    for _ in $(seq 1 12); do
+    for _ in $(seq 1 120); do
       is_running "$container" || break
       is_healthy "$container" "$service_type" && break
       sleep 5
@@ -99,7 +123,7 @@ while sleep 5; do
 
     printf '%s\n' "$start_key" > "$pending_file"
     sync
-    log "Container-only restart lost KernelSU/LSPosed state for $service_name; scheduling one guarded VPS reboot"
+    log "KernelSU/LSPosed initialization is incomplete for $service_name; scheduling one guarded VPS reboot"
     systemctl reboot
     exit 0
   done

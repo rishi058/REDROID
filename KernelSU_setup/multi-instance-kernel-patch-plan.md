@@ -12,8 +12,8 @@ home; the other document links to it rather than restating it.
 | Per-file purpose of everything in `wsl/`, and when to run it | [README.md](README.md#kernel-build-tooling-wsl) |
 | The nine multi-instance requirements and their met/not-met status | [README.md](README.md#requirements-for-a-future-multi-instance-kernel-patch) |
 | Requirement 6 analysis, kernel-capability comparison, operational rules | [README.md](README.md#what-requirement-6-being-out-of-scope-actually-means) |
-| Production/experimental operating rules and current runtime state | [README.md](README.md#current-operational-decision) |
-| Plain-language summary of what two rooted instances cost the operator | [README.md](README.md#read-this-first-running-two-rooted-instances) |
+| Three-production-instance operating rules and current runtime state | [README.md](README.md#current-operational-decision) |
+| Plain-language summary of what three rooted instances cost the operator | [README.md](README.md#read-this-first-running-three-rooted-instances) |
 | Package revisions, SHA256 hashes, per-phase status | **this file** — authoritative, deliberately not restated in README |
 
 When changing anything, update the canonical location, then check the other

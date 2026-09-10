@@ -1,0 +1,13 @@
+[Unit]
+Description=Serialize equal-production ReDroid KernelSU and LSPosed startup
+After=docker.service redroid-binder-permissions.service redroid-v2-binder.service redroid-experimental-binder.service
+Requires=docker.service redroid-binder-permissions.service redroid-v2-binder.service redroid-experimental-binder.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/redroid-sequential-start
+TimeoutStartSec=90min
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

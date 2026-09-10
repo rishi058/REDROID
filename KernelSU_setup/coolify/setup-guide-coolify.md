@@ -2,6 +2,13 @@
 
 This run migrated the existing hand-managed ReDroid deployment to a Coolify-managed Docker Compose service, then installed and validated KernelSU Next, Zygisk Next, LSPosed, Magic Mount, and LiteGapps.
 
+> **Current multi-instance correction (2026-09-10):** `redroid14`,
+> `redroid14-v2`, and `redroid-experimental` are all production services and all
+> must load KernelSU, Zygisk Next, and LSPosed. Older incident sections below use
+> “production” and “experimental” to describe their roles at that historical
+> time; they do not define the current priority model. See
+> [the three-instance startup-race incident](incident-2026-09-10-lsposed-startup-race.md).
+
 Do not put SSH private keys, Coolify API tokens, or Coolify/Sentinel tokens in this file, terminal history, or source control.
 
 ## Final verified state
@@ -68,8 +75,12 @@ All files are in `KernelSU_setup/coolify/`:
 | `install-litegapps.sh` | Installs Magic Mount and verified LiteGapps in separate rebooted stages. |
 | `validate-coolify-redroid.sh` | Validates the root stack or the full GApps stack. |
 | `mitmproxy-ca-post-fs-data.sh` | Rebuilds Android 14's active Conscrypt APEX CA view with the local capture CA. |
-| `redroid-kernelsu-replay.sh` | Detects loss of KernelSU/Zygisk/LSPosed after a Coolify restart for production `5555` or experimental `5557`, then schedules one guarded host reboot. |
+| `redroid-kernelsu-replay.sh` | Detects a missing current-boot LSPosed Binder handshake on any of the three production ReDroid services, then schedules one guarded host reboot. |
 | `redroid-kernelsu-replay.service` | Keeps the guarded multi-instance recovery watcher active on the VPS. |
+| `redroid-sequential-start.sh` | Starts all three equal-production ReDroid services in a deterministic order and requires LSPosed readiness on each. |
+| `redroid-sequential-start.service` | Runs the ordered startup gate automatically after Docker and BinderFS preparation. |
+| `install-redroid-sequential-start.sh` | Persists later-starting service policies, extends LSPosed retries, and installs the startup sequencer. |
+| `incident-2026-09-10-lsposed-startup-race.md` | Complete three-instance LSPosed race diagnosis, failed attempts, permanent fix, and validation evidence. |
 | `redroid-api-network.sh` | Waits for a recreated FastAPI container, calls `/adb/connect`, and recovers its ADB transport on `DEFAULT_ADB_SERIAL`. |
 | `redroid-api-network.service` | Keeps API networking and its ADB transport healthy without restarting ReDroid. |
 
@@ -833,27 +844,26 @@ KernelSU's Zygisk/LSPosed process state. The reproduced failure had correct APK
 paths and LSPosed database scopes but no running `lspd`; Target-App then exited
 itself because PairIPFix and TalsecKill were not injected.
 
-Install the supplied host watcher:
+For the current three-production-instance deployment, install the startup
+sequencer and watcher together:
 
 ```bash
-sudo install -m 0755 \
-  /home/ubuntu/kbuild/coolify/redroid-kernelsu-replay.sh \
-  /usr/local/sbin/redroid-kernelsu-replay
-sudo install -m 0644 \
-  /home/ubuntu/kbuild/coolify/redroid-kernelsu-replay.service \
-  /etc/systemd/system/redroid-kernelsu-replay.service
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now redroid-kernelsu-replay.service
+sudo bash /home/ubuntu/kbuild/coolify/install-redroid-sequential-start.sh
+sudo systemctl reboot
 ```
 
-For each new container start timestamp on either `redroid14` (`5555`) or
-`redroid-experimental` (`5557`), the watcher:
+The installer requires `zygisk_lsposed` in all three persistent data directories.
+If experimental is missing it, restore the module first; do not weaken its gate.
+All three instances are production peers. Their startup positions exist only to
+serialize KernelSU/LSPosed initialization.
+
+For each new container start timestamp on `redroid14` (`5555`), `redroid14-v2`
+(`5559`), or `redroid-experimental` (`5557`), the watcher:
 
 1. waits for Android boot completion;
-2. allows another minute for LSPosed startup;
+2. allows up to ten minutes for LSPosed startup;
 3. checks KernelSU `ksud`, Zygisk Next, LSPosed, GSF/GMS/Play Store, and a
-   running `lspd` process;
+   system-owned `lspd` process with a current-boot `LSPosed-Bridge binder received`;
 4. when any check is missing, writes a persistent recovery-pending guard and
    schedules one complete VPS reboot;
 5. clears the guard only after the next host boot passes every check;
@@ -865,12 +875,12 @@ Docker's running state during boot and health polling. If a container is stopped
 while the watcher is mid-check, the watcher records that start timestamp as a
 manual/container lifecycle event and does not write a pending reboot marker.
 
-Multi-instance behavior: production and experimental use separate service labels,
-stable hostnames, and pending guard files. A failed recovery check for `5557` does
-not reuse the `5555` guard, and a failed `5555` check does not consume the `5557`
-guard. The service still schedules a host reboot rather than a Docker restart,
-because only a VPS boot is known to replay the complete KernelSU/Zygisk/LSPosed
-chain.
+Multi-instance behavior: all three services use separate labels, stable hostnames,
+and pending guard files. A failed recovery check for one service does not consume
+another service's guard. The watcher starts only after the boot sequencer has
+finished or failed, preventing it from treating legitimate serialized startup as
+a fault. It still schedules a host reboot rather than a Docker restart because
+only a VPS boot is known to replay the complete KernelSU/Zygisk/LSPosed chain.
 
 Do not replace this with repeated `ksud post-fs-data` plus Android soft reboots.
 That experiment restored GApps/CA mounts but left `lspd` absent, so Target-App

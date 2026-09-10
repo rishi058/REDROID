@@ -37,6 +37,18 @@ ssh -i "C:/Users/Rishi/.ssh/ssh-key-2026-07-06(pvt).key" `
 ## Accessing GUI of redroid 
 scrcpy -s 127.0.0.1:5555 --max-size=720 --max-fps=24 --video-bit-rate=2M --video-codec=h264 --no-audio
 
+## Connecting PORT to use "adb connect 127.0.0.1:5559"
+
+ssh -i "C:/Users/Rishi/.ssh/ssh-key-2026-07-06(pvt).key" `
+  -o ExitOnForwardFailure=yes `
+  -o ServerAliveInterval=30 `
+  -N `
+  -L 127.0.0.1:5559:127.0.0.1:5559 `
+  ubuntu@141.148.151.172
+
+## Accessing GUI of redroid 
+scrcpy -s 127.0.0.1:5559 --max-size=720 --max-fps=24 --video-bit-rate=2M --video-codec=h264 --no-audio
+
 # REDROID EXPERIMENTAL COMMANDS:
 
 # The experimental instance publishes ADB on host port 5557 (container 5555).

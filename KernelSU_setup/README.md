@@ -4,14 +4,16 @@ This directory contains the reproducible kernel build records, compatibility
 patches, deployment scripts, and operational runbooks for running ReDroid 14
 with KernelSU Next, Zygisk Next, and LSPosed.
 
-The production/experimental boundary is strict:
+Current operating model (corrected 2026-09-10):
 
-- `redroid14` is the production Android instance serving DW-fast-api users.
-- `redroid-experimental` is an isolated Coolify service for application tests.
-- They have separate BinderFS devices, `/data` directories, hostnames, network
+- `redroid14`, `redroid14-v2`, and `redroid-experimental` are all production
+  Android instances. The word `experimental` is now only a stable service name.
+- All three must load KernelSU, Zygisk Next, and LSPosed. Android/Docker health
+  without a current-boot LSPosed Binder handshake is not acceptable.
+- They retain separate BinderFS devices, `/data` directories, hostnames, network
   identities, and ADB paths.
-- Never target production data or recovery actions while operating on the
-  experimental instance.
+- Their deterministic boot order is a technical race-prevention mechanism, not
+  a production priority or trust boundary.
 
 See [coolify/setup-guide-coolify.md](coolify/setup-guide-coolify.md) for the
 validated production runbook and [my_setup_journey.md](my_setup_journey.md) for
@@ -29,26 +31,26 @@ the other document links to it rather than restating it.
 | The nine multi-instance requirements and their met/not-met status | **this file**, [requirements](#requirements-for-a-future-multi-instance-kernel-patch) |
 | Requirement 6 analysis, kernel-capability comparison, operational rules | **this file**, [requirement 6](#what-requirement-6-being-out-of-scope-actually-means) |
 | Production/experimental operating rules and current runtime state | **this file**, [operational decision](#current-operational-decision) |
-| Plain-language summary of what two rooted instances cost the operator | **this file**, [read this first](#read-this-first-running-two-rooted-instances) |
+| Plain-language summary of what three rooted instances cost the operator | **this file**, [read this first](#read-this-first-running-three-rooted-instances) |
 | Build procedure, phase reasoning, execution record, findings, runbook | [multi-instance-kernel-patch-plan.md](multi-instance-kernel-patch-plan.md) |
 | Package revisions, SHA256 hashes, per-phase status | [multi-instance-kernel-patch-plan.md](multi-instance-kernel-patch-plan.md) — authoritative, deliberately **not** restated here |
 
 When changing anything, update the canonical location, then check the other
 document only for statements that would become false.
 
-## Read this first: running two rooted instances
+## Read this first: running three rooted instances
 
-**Goal.** Keep `redroid14` serving production untouched, and run experiments in
-`redroid-experimental` with KernelSU, Zygisk Next, and LSPosed active in **both**
-containers at the same time.
+**Goal.** Run `redroid14`, `redroid14-v2`, and `redroid-experimental` as equal
+production services with KernelSU, Zygisk Next, and LSPosed active in all three.
 
-**Where it stands.** Not achieved yet. The kernel that does it, `6.8.12-zksu-multi`,
-is built and verified on the development machine but **has never been installed or
-booted**. Today the second container still gets no Zygisk and no LSPosed. What
-remains is Phases 8 to 15: install it on the VPS and test it, which needs a
-maintenance window, an Oracle boot-volume backup, and serial-console access first.
-The specific fault is fixed in code and the fix is confirmed present in the built
-kernel, but it has never run, so treat it as "expected to work, unproven".
+**Where it stands.** `6.8.12-zksu-multi` is installed and has run multiple rooted
+ReDroid instances simultaneously. The 2026-09-10 third-instance deployment exposed
+an LSPosed startup race when dockerd started all Android systems concurrently. The
+canonical repair serializes their starts and requires a current-boot LSPosed Binder
+handshake from each. During the incident, experimental's persistent data was found
+to be missing `zygisk_lsposed`; restore that module before deploying the strict
+all-three gate. See
+[the incident record](coolify/incident-2026-09-10-lsposed-startup-race.md).
 
 **Three things you give up, in plain words.** None of them stops Zygisk or LSPosed
 from running, and none makes production worse than it is today.
@@ -152,19 +154,15 @@ has moved off v6.8.12. Normal reproduction uses the committed patches, which
 | [vps/patches/linux-mainline-6.8-binder-exports.patch](vps/patches/linux-mainline-6.8-binder-exports.patch) | Linux | Exports the eleven core-kernel symbols `binder_linux.ko` imports. Apply after the module patch. |
 | [vps/patches/kernelsu-redroid-multi-instance.patch](vps/patches/kernelsu-redroid-multi-instance.patch) | KernelSU Next | Generated output of `apply-multi-instance.py`, kept for review. Regenerate it from the script; do not hand-edit. |
 
-## Important: KernelSU boot initialization is currently single-instance
+## Historical limitation: single-instance boot initialization (superseded)
 
 The current `6.8.12-zksu` host kernel cannot independently initialize the full
 KernelSU boot stack for multiple concurrent ReDroid containers.
 
-> **Status as of 2026-08-20.** This section still describes the kernel that is
-> *running in production*. A candidate replacement, `6.8.12-zksu-multi`, has been
-> built and addresses it, but it has never been installed or booted. Everything
-> below therefore remains the operational reality until Phases 8 through 15 of
-> [multi-instance-kernel-patch-plan.md](multi-instance-kernel-patch-plan.md) are
-> complete. See
-> [requirement status](#status-of-these-requirements-in-6812-zksu-multi) for what
-> the candidate does and does not solve.
+> **Historical state as of 2026-08-20.** This section explains the old
+> `6.8.12-zksu` limitation that motivated the multi-instance patch. The replacement
+> `6.8.12-zksu-multi` is now installed and runtime-validated. Current operations
+> are defined at [Current operational decision](#current-operational-decision).
 
 This was verified on 2026-08-19:
 
@@ -281,12 +279,13 @@ when multiple Android instances boot concurrently.
 | 8 | Met. All four compatibility patches retained, plus the new Binder module and export patches. |
 | 9 | Met. `pidns=` appears in every init, zygote, registration, and reap message. |
 
-Runtime behaviour is still unvalidated. "Met" here means implemented and compiled,
-not tested on hardware.
+At the time this requirements table was written, “Met” meant implemented and
+compiled but not tested on hardware. Runtime validation was subsequently completed;
+see `phase8.md` and the three-instance Coolify incident record.
 
 ### What actually changes between the two kernels
 
-| Capability | `6.8.12-zksu` (running) | `6.8.12-zksu-multi` (candidate) |
+| Capability | `6.8.12-zksu` (historical) | `6.8.12-zksu-multi` (installed) |
 |---|---|---|
 | First instance: modules mounted, Zygisk Next, `lspd` | Active | Active |
 | Second instance: modules mounted, Zygisk Next, `lspd` | **Dead.** Module `update` markers stay pending, no Zygisk process, no `lspd` | **Active** |
@@ -296,9 +295,9 @@ not tested on hardware.
 | KernelSU Manager **GUI** app | Works in the one live instance | Works in one instance at a time, and the instances de-register each other |
 | `su` UID allowlist | Single instance, so no conflict | Shared and cross-pruned between instances |
 
-The first three rows are the objective. The last two rows are requirement 6, and
-they are the price of not solving it. Nothing in the table gets *worse* for a
-single instance, which matters because production is the first instance today.
+The first three rows were the objective. The last two rows are requirement 6, and
+they are the price of not solving it. The current deterministic startup order is
+used only to avoid an LSPosed timing race; it does not assign production priority.
 
 ### What requirement 6 being out of scope actually means
 
@@ -502,19 +501,18 @@ Ubuntu kernels as bootable rollback entries.
 
 ## Current operational decision
 
-A candidate kernel now exists but has not been installed or booted, so nothing
-about production behaviour has changed yet. Until `6.8.12-zksu-multi` has passed
-the test matrix above on the real host:
+`6.8.12-zksu-multi` is installed on the real host. All three ReDroid services are
+production peers and must independently provide KernelSU, Zygisk Next, and LSPosed.
+Keep their separate BinderFS and `/data` paths. Start them sequentially using the
+Coolify/systemd procedure in
+[the 2026-09-10 incident record](coolify/incident-2026-09-10-lsposed-startup-race.md);
+the sequence position is not a service-priority declaration.
 
-- keep `redroid14` as the first production Android instance after host boot;
-- do not boot-order `redroid-experimental` ahead of production;
-- do not install Magic Mount or systemless GApps in experimental while its
-  KernelSU stages remain inactive;
-- use experimental as clean Android, or move the full experimental root stack
-  to a separate VPS.
+The incident inspection found `zygisk_lsposed` missing from the experimental data
+directory. The strict repository scripts intentionally fail until it is restored;
+do not weaken the experimental readiness gate to make deployment appear healthy.
 
-Once the candidate is validated, add one standing rule that the kernel does not
-enforce: **keep the KernelSU `su` UID allowlist empty**, and install or remove
+One standing rule remains: **keep the KernelSU `su` UID allowlist empty**, and install or remove
 modules per instance with the `ksud` CLI from a root adb shell rather than the
 KernelSU Manager GUI. Root grants are keyed on a bare numeric UID that means
 different apps in different containers, so an allowlist entry added in
