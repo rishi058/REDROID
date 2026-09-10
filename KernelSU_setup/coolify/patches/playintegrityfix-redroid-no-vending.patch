@@ -1,0 +1,234 @@
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -5,6 +5,88 @@ This module tries to fix Play Integrity verdicts to get a valid attestation.
+ ## NOTE
+ 
+ This module is not made to hide root, nor to avoid detections in other apps. It only serves to pass Device verdict in the Play Integrity tests and certify your device.
++
++## ReDroid downstream hardening
++
++This checkout contains a ReDroid-specific production patch and must not be
++treated as the unmodified upstream `inject-s` module.
++
++### Why Play Store is excluded
++
++The stock native module classifies both `com.google.android.gms` and
++`com.android.vending` as GMS targets. It requests `FORCE_DENYLIST_UNMOUNT` and
++loads the companion payload before evaluating the Vending spoof flags. On the
++systemless LiteGApps ReDroid image this hid the mount containing `Phonesky.apk`
++from Play Store and contributed to a persistent
++`Resources.getConfiguration()` crash loop, even when `spoofVendingBuild` and
++`spoofVendingSdk` were false.
++
++The downstream `preAppSpecialize()` implementation now:
++
++1. Returns and unloads immediately for the exact `com.android.vending` process.
++2. Performs no forced unmount, companion IPC, config loading, or hook setup in
++   Play Store.
++3. Selects only the exact `com.google.android.gms.unstable` DroidGuard process.
++4. Requests `FORCE_DENYLIST_UNMOUNT` only after that exact selection.
++
++The obsolete Vending post-specialization branch and state were removed. This
++intentionally disables `spoofVendingBuild` and `spoofVendingSdk` in this build;
++GMS/DroidGuard integrity injection remains enabled.
++
++### Module identity and update policy
++
++```text
++name=Play Integrity Fix [REDROID NO-VENDING]
++version=v4.7-1-redroid.2
++versionCode=47102
++```
++
++The upstream `updateJson` is intentionally removed. Installing an upstream
++update would silently restore the Vending specialization and the crash loop.
++
++### Reproducible Windows build
++
++KernelSU module scripts and properties must be UTF-8 without BOM and use LF
++line endings. `normalizeModuleTextFiles` runs before
++`generateModulePropChecksum`, ensuring that the CRC embedded in the native
++library exactly matches the bytes packaged as `module.prop`. Reversing that
++order causes PIF to mark itself as tampered and reject its companion payload.
++
++Prerequisites are JDK 21+, Android Platform/Build Tools 37, NDK
++`29.0.14206865`, and CMake `3.30.5+`.
++
++```powershell
++.\gradlew.bat clean :zygisk:assembleRelease
++
++python ..\..\KernelSU_setup\coolify\validate-pif-no-vending.py `
++  .\out\PlayIntegrityFix.zip
++```
++
++Output: `out/PlayIntegrityFix.zip`.
++
++Validated production artifact:
++
++```text
++win-kernelSU-setup/artifacts/integrity/PlayIntegrityFix_v4.7-1-redroid.2-no-vending.zip
++SHA-256 f4e54d7e0de02579fb77056a34dec3a91b6a0b50c4a004640fa3f6b4488d9761
++```
++
++The durable parent-repository patch is
++`KernelSU_setup/coolify/patches/playintegrityfix-redroid-no-vending.patch`.
++
++### Runtime verification
++
++After KernelSU/Zygisk activation, verify that:
++
++- Play Store keeps a stable PID with no new `Resources.getConfiguration()`
++  fatal exceptions.
++- `Phonesky.apk` remains visible through `/proc/<vending-pid>/root/...`.
++- PIF has no mapping in `com.android.vending`.
++- PIF remains mapped in `com.google.android.gms.unstable`.
++- `module.prop` does not contain the tampered-module warning.
++
++Production activation requires a planned VPS reboot; a Docker-only restart is
++not a reliable KernelSU/Zygisk activation boundary.
+ 
+ ## Tutorial
+ 
+diff --git a/build.gradle.kts b/build.gradle.kts
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -5,6 +5,7 @@ plugins {
+ 
+ tasks.register("copyZygiskFiles") {
+     description = "Copy Zygisk Files"
++    dependsOn("normalizeModuleTextFiles")
+     val moduleFolder = project.rootDir.resolve("module")
+     val zygiskBuildDir = project.rootDir.resolve("zygisk/build")
+     val classesJar = zygiskBuildDir.resolve("intermediates/dex/release/minifyReleaseWithR8/classes.dex")
+@@ -27,6 +28,35 @@ tasks.register("copyZygiskFiles") {
+     }
+ }
+ 
++tasks.register("normalizeModuleTextFiles") {
++    description = "Normalize KernelSU module text files to UTF-8/LF"
++
++    val moduleFolder = project.rootDir.resolve("module")
++    inputs.dir(moduleFolder)
++    outputs.dir(moduleFolder)
++    outputs.upToDateWhen { false }
++
++    doLast {
++        moduleFolder.walkTopDown()
++            .filter { file ->
++                file.isFile && (
++                    file.extension in setOf("sh", "prop") ||
++                        file.name in setOf("update-binary", "updater-script")
++                    )
++            }
++            .forEach { file ->
++                val original = file.readText(Charsets.UTF_8)
++                val normalized = original
++                    .removePrefix("\uFEFF")
++                    .replace("\r\n", "\n")
++                    .replace("\r", "\n")
++                if (normalized != original) {
++                    file.writeText(normalized, Charsets.UTF_8)
++                }
++            }
++    }
++}
++
+ tasks.register<Zip>("zip") {
+     description = "Zip Module"
+     dependsOn("copyZygiskFiles")
+diff --git a/zygisk/build.gradle.kts b/zygisk/build.gradle.kts
+--- a/zygisk/build.gradle.kts
++++ b/zygisk/build.gradle.kts
+@@ -8,6 +8,7 @@ plugins {
+ 
+ tasks.register("generateModulePropChecksum") {
+     description = "Generate Module Checksum"
++    dependsOn(rootProject.tasks["normalizeModuleTextFiles"])
+     val propFile = project.rootDir.resolve("module/module.prop")
+     val checksumHeader = project.projectDir.resolve("src/main/cpp/checksum.h")
+ 
+diff --git a/zygisk/src/main/cpp/zygisk.cpp b/zygisk/src/main/cpp/zygisk.cpp
+--- a/zygisk/src/main/cpp/zygisk.cpp
++++ b/zygisk/src/main/cpp/zygisk.cpp
+@@ -510,6 +510,5 @@ public:
+     void preAppSpecialize(AppSpecializeArgs *args) override {
+         payloadLoaded = false;
+         isGmsUnstable = false;
+-        isVending = false;
+         gConfig = {};
+         gDexBytes.clear();
+@@ -539,23 +538,31 @@ public:
+             env->ReleaseStringUTFChars(args->nice_name, rawName);
+         }
+ 
+-        const std::string_view appDir(dir);
+-        const bool isGms = appDir.ends_with("/com.google.android.gms") || appDir.ends_with("/com.android.vending");
+-        if (!isGms) {
++        const std::string_view niceName(name);
++        if (niceName == VENDING_PACKAGE) {
++            // ReDroid uses a systemless LiteGApps Play Store. Requesting
++            // FORCE_DENYLIST_UNMOUNT for Vending hides the mount containing
++            // Phonesky.apk, while even the otherwise-no-op companion path has
++            // repeatedly destabilized ActivityThread.handleBindApplication().
++            // Play Integrity attestation is handled by DroidGuard, so this
++            // downstream build must leave every Play Store process untouched.
++            LOGD("[SKIP] Play Store is excluded from PIF specialization");
+             api->setOption(DLCLOSE_MODULE_LIBRARY);
+             return;
+         }
+ 
+-        api->setOption(FORCE_DENYLIST_UNMOUNT);
+-
+-        const std::string_view niceName(name);
++        const std::string_view appDir(dir);
+         isGmsUnstable = niceName == DROIDGUARD_PACKAGE;
+-        isVending = niceName == VENDING_PACKAGE;
+-        if (!isGmsUnstable && !isVending) {
++        if (!isGmsUnstable || !appDir.ends_with("/com.google.android.gms")) {
+             api->setOption(DLCLOSE_MODULE_LIBRARY);
+             return;
+         }
+ 
++        // Only DroidGuard needs PIF's isolated namespace and companion payload.
++        // Applying this option before exact process selection also affected
++        // unrelated GMS processes and Play Store.
++        api->setOption(FORCE_DENYLIST_UNMOUNT);
++
+         payloadLoaded = requestPayload(api->connectCompanion());
+         if (!payloadLoaded) {
+             api->setOption(DLCLOSE_MODULE_LIBRARY);
+@@ -583,11 +591,5 @@ public:
+             if (gConfig.spoofProps) {
+                 doHook();
+             }
+-        } else if (isVending) {
+-            if (gConfig.spoofVendingBuild) {
+-                updateBuildFields();
+-            } else if (gConfig.spoofVendingSdk) {
+-                doSpoofVending();
+-            }
+         }
+     }
+@@ -601,5 +602,4 @@ private:
+     JNIEnv *env = nullptr;
+     bool payloadLoaded = false;
+     bool isGmsUnstable = false;
+-    bool isVending = false;
+ };
+diff --git a/module/module.prop b/module/module.prop
+--- a/module/module.prop
++++ b/module/module.prop
+@@ -1,7 +1,6 @@
+ id=playintegrityfix
+-name=Play Integrity Fix [INJECT]
+-version=v4.7-1-inject-s
+-versionCode=471
+-author=chiteroman, KOWX712
+-description=Universal modular fix for Play Integrity on devices running Android 8-17
+-updateJson=https://fastly.jsdelivr.net/gh/KOWX712/playintegrityfix@inject_s/update.json
++name=Play Integrity Fix [REDROID NO-VENDING]
++version=v4.7-1-redroid.2
++versionCode=47102
++author=chiteroman, KOWX712; ReDroid hardening by Diskwala
++description=ReDroid build: PIF is restricted to GMS DroidGuard and never specializes Play Store

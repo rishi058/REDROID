@@ -47,16 +47,16 @@ Backup of the pre-fix dir: on exp at `/data/local/tmp/ts_bak_<timestamp>/`
 ## Changes made AFTER DEVICE already passed (did NOT change the verdict)
 Kept because they move exp toward the passing WSL device, but none flipped BASIC:
 - **Identity:** installed `redroid_pixel5` global `system.prop` module (full coherent redfin/Pixel 5 identity incl. `ro.product.first_api_level=30`); **disabled PIF** (`playintegrityfix`). Script: [install_redroid_pixel5_exp.sh](integrity-debug/scripts/install_redroid_pixel5_exp.sh)
-- **GApps:** disabled `litegapps`, installed **MindTheGapps 14.0.0-arm64-20240226** as a Magic Mount module. Script: [install_mindthegapps_arm64_exp.sh](integrity-debug/scripts/install_mindthegapps_arm64_exp.sh); zip on VPS `/home/ubuntu/kbuild/artifacts/gapps/` (md5 `a0905cc7bf3f4f4f2e3f59a4e1fc789b`).
+- **GApps experiment:** MindTheGapps 14.0.0-arm64-20240226 was tested and did not affect the DEVICE verdict. On 2026-09-07 it was permanently removed from `redroid-experimental` and the lighter existing `litegapps` module was re-enabled to reduce persistent disk and runtime footprint.
 - **Account:** signed into `rishiqwerty01@gmail.com` (user). Confirmed **not** the cause of DEVICE pass.
 
 ## Current exp module stack
-`meta-mm` (Magic Mount), `redroid_pixel5` (identity), `mindthegapps`, `tricky_store` v1.4.1, `zygisksu` (Zygisk Next 1.4.3) — enabled.
-`litegapps`, `playintegrityfix` — disabled.
+`meta-mm` (Magic Mount), `redroid_pixel5` (identity), `litegapps`, `tricky_store` v1.4.1, `zygisksu` (Zygisk Next 1.4.3) — enabled.
+`playintegrityfix` — disabled. `mindthegapps` is absent.
 
 ## Still open: BASIC fails on exp but passes on WSL
 Not changed in this session (documented for the next step, no action taken):
-- exp and WSL now share: same keybox, TrickyStore v1.4.1, security_patch.txt, target.txt (+vending), redroid_pixel5 identity, MindTheGapps, no PIF.
+- exp and WSL share the keybox, TrickyStore v1.4.1, security patch, target list (+vending), Pixel 5 identity, and no PIF. Their GApps distributions intentionally differ after experimental returned to LiteGApps.
 - Remaining differences exp vs WSL: **arch** (exp arm64 / Oracle-KVM vs WSL x86 / Hyper-V), **kernel** (`6.8.12-zksu-multi` vs `5.15…WSL2-redroid-ksu`), **LSPosed** present on WSL only, **egress IP** (datacenter vs residential).
 - BASIC does not use the keybox the way DEVICE does; the remaining gap points at environment/arch rather than the attestation config.
 
@@ -82,7 +82,7 @@ Candidate cause: (a) the release string read by DroidGuard's legacy BASIC scan, 
 ## How to revert (exp only)
 - TrickyStore: restore `/data/local/tmp/ts_bak_<timestamp>/` over `/data/adb/tricky_store/`.
 - Identity: `rm -rf /data/adb/modules/redroid_pixel5`; `rm /data/adb/modules/playintegrityfix/disable`.
-- GApps: `rm -rf /data/adb/modules/mindthegapps`; `rm /data/adb/modules/litegapps/disable`.
+- GApps: MindTheGapps was permanently deleted to save space; LiteGApps is the retained experimental module.
 - Restart the exp container to apply.
 
 

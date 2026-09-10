@@ -353,7 +353,7 @@ done
 ```
 
 **Why `com.android.vending` is excluded from the apps list:**
-Previous deployment (TEESimulator-RS v6.0.1) documented that injecting the current module stack (Zygisk Next + PIF + TEESimulator) into the Play Store process (`com.android.vending`) triggers an early Android `Resources` NPE, crashing Play Store before the UI appears. This was reproduced and confirmed in the notes in `KernelSU_setup/coolify/setup-guide-coolify.md` Section 8. The `Resources` NPE originates from the module's in-process KeyMint code running before Android's resource subsystem is ready in the Play Store process. GMS (`com.google.android.gms`) does not have this problem — it initializes differently.
+Previous deployment (TEESimulator-RS v6.0.1) documented that injecting the current module stack into the Play Store process (`com.android.vending`) triggers an early Android `Resources` NPE, crashing Play Store before the UI appears. This was reproduced and confirmed in `KernelSU_setup/coolify/setup-guide-coolify.md`. Later source review narrowed the remaining actor: target-list exclusion was already correct, but the stock PIF `inject-s` native code still selected Vending, requested `FORCE_DENYLIST_UNMOUNT`, and loaded its companion payload before evaluating the false Vending spoof flags. The final ReDroid PIF build now exits before all of those operations for Play Store and reserves PIF specialization for the exact `com.google.android.gms.unstable` DroidGuard process. GMS initializes differently and remains the required attestation path.
 
 **`patchLevel` field:**
 - `"today"` is a literal string accepted by teesim v4.0 meaning "use the current date"; this prevents staleness in the `ro.build.date` comparison Google makes during attestation.

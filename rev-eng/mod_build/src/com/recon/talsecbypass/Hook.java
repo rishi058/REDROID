@@ -5,6 +5,8 @@ import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
+import java.lang.ref.WeakReference;
+import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -13,7 +15,14 @@ import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /* Targeted freeRASP/Talsec reaction guard for com.target-appapp.
    The app obfuscated the freeRASP SDK, so generic unrasp couldn't hook it. The
@@ -79,7 +88,49 @@ public class Hook implements IXposedHookLoadPackage {
     private static final boolean LIMIT_APPLOVIN_RELOADS = true;
     private static final boolean DISABLE_APPLOVIN_AUTO_REFRESH = true;
     private static final long APPLOVIN_LOAD_COOLDOWN_MS = 10L * 60L * 1000L;
-    private static final long BIDMACHINE_IDLE_THREAD_TIMEOUT_SECONDS = 30L;
+    private static final int APPLOVIN_TRACKED_UNIT_LIMIT = 64;
+
+    // Exact root-cause fix: Talsec's R2.P creates a fresh four-core scheduler on
+    // every React host resume, stores only its Future, and never shuts the pool
+    // down. Reuse one scheduler while preserving R2's schedule/cancel behavior.
+    private static final boolean REUSE_TALSEC_ACCESSIBILITY_SCHEDULER = true;
+    // Broad constructor telemetry was needed only to identify R2.P. Keep the
+    // implementation available for diagnostics but disable it in the final fix.
+    private static final boolean EXECUTOR_ATTRIBUTION_ENABLED = false;
+
+    // ── ad-SDK scheduled-pool thread-leak containment (v1.4) ──────────────────
+    // ROOT-CAUSE FIX. Ad loaders each create a ScheduledThreadPoolExecutor via
+    // Executors.newScheduledThreadPool(2..4), submit one-shot work, and NEVER
+    // call shutdown(), so 2-4 CORE workers park forever in
+    // ScheduledThreadPoolExecutor$DelayedWorkQueue.take(). Hundreds of ad loads
+    // => thousands of dead threads and ~1 GiB RSS, which saturates the
+    // single-core Redroid and hangs the device (TALSEC_v1.3.md §3, §10). The fix
+    // lets IDLE CORE workers of ad-owned pools retire and be recreated on
+    // demand: allowCoreThreadTimeOut(true) + a keep-alive. Task semantics are
+    // unchanged — only workers that have sat idle with an empty queue retire.
+    //
+    // SAFETY: allowCoreThreadTimeOut on a ScheduledThreadPoolExecutor can orphan
+    // a queued task only if that task's delay/period exceeds the keep-alive AND
+    // every worker times out first. Decompiled ground truth: io.bidmachine (the
+    // dominant, confirmed owner) does ZERO periodic scheduling and only submits
+    // immediate/short work, so it can never be orphaned. For any other owner we
+    // broaden to, the periodic auto-backoff guards below disable the timeout on
+    // any pool that ever receives a periodic task, so broadening stays safe.
+    // v1.4.1 is attribution-only. Do not mutate any SDK executor until its
+    // concrete pool-N prefix and constructor owner are proven under live load.
+    private static final boolean CONTAIN_SCHEDULED_POOL_LEAK = false;
+    // Owner package prefixes whose scheduled pools get the idle-core timeout.
+    // Default: only io.bidmachine (proven one-shot + the dominant leaker). The
+    // monitoring below prints every other owner and its pool count so the list
+    // can be widened from evidence; the periodic auto-backoff keeps that safe.
+    private static final String[] SCHEDULED_POOL_TRIM_OWNER_PREFIXES = {};
+    // Idle keep-alive for a trimmed pool's core workers. 60s comfortably retires
+    // the leaked one-shot pools while keeping a warm worker for any short
+    // periodic task (period < keep-alive re-runs before the worker retires).
+    private static final long SCHEDULED_POOL_IDLE_TIMEOUT_SECONDS = 60L;
+    // Throttle for the process thread-count / pool summary emitted to logcat.
+    private static final long POOL_MONITOR_INTERVAL_MS = 60L * 1000L;
+    private static final int MAX_EXECUTOR_CREATE_LOGS = 2000;
 
     // ── mutable state ────────────────────────────────────────────────────────
     private static boolean loggedAppiCryptCheckSchema = false;
@@ -92,11 +143,32 @@ public class Hook implements IXposedHookLoadPackage {
     private static final Map<String, Long> appLovinLastAllowedLoad = new LinkedHashMap<>();
     private static final Map<String, Integer> appLovinSuppressedLoads = new LinkedHashMap<>();
     private static boolean loggedAutoRefreshBlock = false;
-    private static final Object bidMachinePoolLock = new Object();
-    private static int bidMachinePoolsConfigured = 0;
-    private static final Set<ScheduledThreadPoolExecutor> configuredBidMachinePools =
+    private static final Object talsecSchedulerLock = new Object();
+    private static ScheduledThreadPoolExecutor talsecAccessibilityScheduler = null;
+    private static int talsecSchedulerReuses = 0;
+    private static final AtomicInteger talsecSchedulerThreadNumber = new AtomicInteger(1);
+    private static final Object scheduledPoolLock = new Object();
+    private static int scheduledPoolsSeen = 0;
+    private static int ordinaryPoolsSeen = 0;
+    private static int executorCreateLogs = 0;
+    private static int scheduledFactoryProbeHits = 0;
+    private static int scheduledFactoryLogs = 0;
+    private static int scheduledPoolsTrimmed = 0;
+    private static int scheduledPoolsBackedOff = 0;
+    private static long lastPoolMonitorMs = 0L;
+    // Pools we applied the idle-core timeout to (identity keys, weakly held so a
+    // reclaimed pool does not pin memory).
+    private static final Set<ScheduledThreadPoolExecutor> trimmedPools =
         Collections.newSetFromMap(new WeakHashMap<ScheduledThreadPoolExecutor, Boolean>());
+    // Pools reverted because they received a periodic task — never re-trim these.
+    private static final Set<ScheduledThreadPoolExecutor> periodicPools =
+        Collections.newSetFromMap(new WeakHashMap<ScheduledThreadPoolExecutor, Boolean>());
+    // Weak identity registry. WeakHashMap uses equals/hashCode and can merge
+    // executor subclasses that override them; this list dedupes strictly by ==.
+    private static final ArrayList<WeakReference<ThreadPoolExecutor>> observedExecutorPools =
+        new ArrayList<>();
     private static final Map<String, Integer> scheduledPoolOwnerCounts = new LinkedHashMap<>();
+    private static final Map<String, Integer> ordinaryPoolOwnerCounts = new LinkedHashMap<>();
 
     // ────────────────────────────────────────────────────────────────────────
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) throws Throwable {
@@ -160,7 +232,14 @@ public class Hook implements IXposedHookLoadPackage {
             hookCachedRevenueCatCustomerInfo(cl);
         }
         hookAppLovinResourceGuards(cl);
-        hookBidMachineExecutorContainment(cl);
+        if (REUSE_TALSEC_ACCESSIBILITY_SCHEDULER) {
+            hookTalsecAccessibilitySchedulerReuse();
+        }
+        if (EXECUTOR_ATTRIBUTION_ENABLED) {
+            hookScheduledPoolContainment(cl);
+        } else {
+            XposedBridge.log(TAG + "broad executor attribution disabled in final fix");
+        }
 
         // 1) Keep native freeRASP/AppiCrypt initialization enabled by default.
         //    The old no-op is retained behind an explicit diagnostic switch so
@@ -337,6 +416,7 @@ public class Hook implements IXposedHookLoadPackage {
                         long remaining;
                         int suppressed;
                         synchronized (appLovinLoadLock) {
+                            pruneAppLovinLoadState(now);
                             Long last = appLovinLastAllowedLoad.get(key);
                             if (last == null || now - last.longValue() >= APPLOVIN_LOAD_COOLDOWN_MS) {
                                 appLovinLastAllowedLoad.put(key, Long.valueOf(now));
@@ -370,117 +450,597 @@ public class Hook implements IXposedHookLoadPackage {
         }
     }
 
+    // The app currently has only a handful of static MAX units, but keep this
+    // module-owned cache bounded if a future app version supplies dynamic IDs.
+    private static void pruneAppLovinLoadState(long now) {
+        Iterator<Map.Entry<String, Long>> iterator =
+            appLovinLastAllowedLoad.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<String, Long> entry = iterator.next();
+            if (now - entry.getValue().longValue() >= APPLOVIN_LOAD_COOLDOWN_MS) {
+                appLovinSuppressedLoads.remove(entry.getKey());
+                iterator.remove();
+            }
+        }
+        while (appLovinLastAllowedLoad.size() >= APPLOVIN_TRACKED_UNIT_LIMIT) {
+            Iterator<String> keys = appLovinLastAllowedLoad.keySet().iterator();
+            if (!keys.hasNext()) break;
+            String eldest = keys.next();
+            keys.remove();
+            appLovinSuppressedLoads.remove(eldest);
+        }
+    }
+
+    private void hookTalsecAccessibilitySchedulerReuse() {
+        try {
+            XposedHelpers.findAndHookMethod(
+                Executors.class, "newScheduledThreadPool", int.class,
+                new XC_MethodHook() {
+                    protected void beforeHookedMethod(MethodHookParam p) {
+                        try {
+                            int requestedCore = ((Number) p.args[0]).intValue();
+                            if (requestedCore != 4 || !calledFromTalsecR2P()) return;
+
+                            ScheduledThreadPoolExecutor scheduler;
+                            int reuseCount;
+                            synchronized (talsecSchedulerLock) {
+                                scheduler = talsecAccessibilityScheduler;
+                                if (scheduler == null || scheduler.isShutdown()
+                                        || scheduler.isTerminated()) {
+                                    final ThreadFactory delegate =
+                                        Executors.defaultThreadFactory();
+                                    scheduler = new ScheduledThreadPoolExecutor(
+                                        requestedCore, new ThreadFactory() {
+                                            public Thread newThread(Runnable task) {
+                                                Thread thread = delegate.newThread(task);
+                                                thread.setName("TalsecA11yMonitor-"
+                                                    + talsecSchedulerThreadNumber.getAndIncrement());
+                                                return thread;
+                                            }
+                                        });
+                                    scheduler.setRemoveOnCancelPolicy(true);
+                                    talsecAccessibilityScheduler = scheduler;
+                                    talsecSchedulerReuses = 0;
+                                    XposedBridge.log(TAG
+                                        + "Talsec R2.P shared scheduler created core="
+                                        + requestedCore);
+                                }
+                                reuseCount = ++talsecSchedulerReuses;
+                            }
+
+                            p.setResult(scheduler);
+                            if (reuseCount <= 5 || reuseCount % 50 == 0) {
+                                XposedBridge.log(TAG
+                                    + "Talsec R2.P scheduler reused count=" + reuseCount
+                                    + " id=" + Integer.toHexString(
+                                        System.identityHashCode(scheduler)));
+                            }
+                        } catch (Throwable t) {
+                            // Fail open: if the guard cannot prove/reuse the
+                            // scheduler, run the app's original factory call.
+                            XposedBridge.log(TAG
+                                + "Talsec R2.P scheduler reuse note: " + t);
+                        }
+                    }
+                });
+            XposedBridge.log(TAG + "Talsec R2.P scheduler reuse hook installed");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG
+                + "Talsec R2.P scheduler reuse hook FAILED: " + t);
+        }
+    }
+
+    private static boolean calledFromTalsecR2P() {
+        boolean sawR2P = false;
+        boolean sawH4ResumeRegistration = false;
+        boolean sawTalsecHostResume = false;
+        for (StackTraceElement frame : Thread.currentThread().getStackTrace()) {
+            String className = frame.getClassName();
+            String methodName = frame.getMethodName();
+            // Runtime telemetry from this exact APK reports raw DEX names R2,
+            // h4.g and wd.M (JADX's "defpackage" is only a source alias).
+            if ("R2".equals(className) && "P".equals(methodName)) sawR2P = true;
+            if ("h4.g".equals(className) && "b".equals(methodName)) {
+                sawH4ResumeRegistration = true;
+            }
+            if ("wd.M".equals(className) && "onHostResume".equals(methodName)) {
+                sawTalsecHostResume = true;
+            }
+        }
+        return sawR2P && sawH4ResumeRegistration && sawTalsecHostResume;
+    }
+
     // ART dumps showed hundreds of default-named workers owned by BidMachine's
     // GAMTaskLoader. Every loader creates a 2–4 core scheduled executor, submits
     // only immediate work, and never shuts it down. Keep all executor/task
     // semantics, but allow idle core workers to retire and be recreated later.
-    private void hookBidMachineExecutorContainment(final ClassLoader cl) {
+    private void hookScheduledPoolContainment(final ClassLoader cl) {
+        // 1) Observe ordinary pools as well. v1.4 covered only STPE while live
+        //    pool-N workers grew by hundreds; fixed/cached/single executors use
+        //    the ThreadPoolExecutor base class instead.
         try {
-            // Constructor-level interception reliably sees the executor before
-            // Executors.newScheduledThreadPool() returns it to GAMTaskLoader.
-            // Every scheduled pool is observed, but mutation is restricted to
-            // the exact verified BidMachine construction stack.
+            XposedBridge.hookAllConstructors(
+                ThreadPoolExecutor.class, new XC_MethodHook() {
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        try {
+                            if (!(p.thisObject instanceof ThreadPoolExecutor)) return;
+                            if (p.thisObject instanceof ScheduledThreadPoolExecutor) return;
+                            ThreadPoolExecutor pool = (ThreadPoolExecutor) p.thisObject;
+                            String owner = scheduledExecutorOwner();
+                            recordExecutorPool("TPE", pool, owner, "constructor");
+                            maybeLogPoolMonitor();
+                        } catch (Throwable t) {
+                            XposedBridge.log(TAG + "ordinary-pool afterCtor note: " + t);
+                        }
+                    }
+                });
+            XposedBridge.log(TAG + "ordinary-pool constructor probe installed");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "ordinary-pool constructor hook FAILED: " + t);
+        }
+
+        // 2) Every scheduled pool the app or an ad SDK creates goes through a
+        //    `new ScheduledThreadPoolExecutor(...)` (both
+        //    Executors.newScheduledThreadPool and newSingleThreadScheduledExecutor
+        //    construct one). Intercepting the constructor catches ALL of them
+        //    regardless of which SDK, so we can attribute the owner from the live
+        //    construction stack and retire idle CORE workers only for ad-owned
+        //    pools. This is the interception point the v1.3 probe already proved
+        //    fires; the fix here is correct owner attribution + applying the
+        //    timeout by owner package instead of one hard-coded class.
+        try {
             XposedBridge.hookAllConstructors(
                 ScheduledThreadPoolExecutor.class, new XC_MethodHook() {
                     protected void afterHookedMethod(MethodHookParam p) {
-                        String owner = scheduledExecutorOwner();
-                        logScheduledPoolOwner(owner);
-                        if (!owner.startsWith(
-                                "io.bidmachine.ads.networks.gam.GAMLoader$GAMTaskLoader#")) {
-                            return;
+                        try {
+                            if (!(p.thisObject instanceof ScheduledThreadPoolExecutor)) return;
+                            ScheduledThreadPoolExecutor pool =
+                                (ScheduledThreadPoolExecutor) p.thisObject;
+                            String owner = scheduledExecutorOwner();
+                            recordExecutorPool("STPE", pool, owner, "constructor");
+                            if (CONTAIN_SCHEDULED_POOL_LEAK && ownerIsTrimTarget(owner)) {
+                                trimScheduledPool(pool, owner);
+                            }
+                            maybeLogPoolMonitor();
+                        } catch (Throwable t) {
+                            XposedBridge.log(TAG + "scheduled-pool afterCtor note: " + t);
                         }
-                        configureBidMachineExecutor(
-                            (ScheduledThreadPoolExecutor) p.thisObject, "constructor-stack");
                     }
                 });
-            XposedBridge.log(TAG + "scheduled-executor owner probe installed");
+            XposedBridge.log(TAG + "scheduled-pool constructor probe installed");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "scheduled-pool constructor hook FAILED: " + t);
+        }
 
-            // Keep the owner after-hook as a narrow fallback on versions where
-            // boot-class constructor hooks are restricted by the runtime.
-            Class<?> taskLoader = XposedHelpers.findClass(
-                "io.bidmachine.ads.networks.gam.GAMLoader$GAMTaskLoader", cl);
-            XposedBridge.hookAllConstructors(taskLoader, new XC_MethodHook() {
+        installScheduledFactoryProbe("newScheduledThreadPool", int.class);
+        installScheduledFactoryProbe(
+            "newScheduledThreadPool", int.class, ThreadFactory.class);
+        installScheduledFactoryProbe("newSingleThreadScheduledExecutor");
+        installScheduledFactoryProbe(
+            "newSingleThreadScheduledExecutor", ThreadFactory.class);
+
+        runExecutorTelemetryCanary();
+
+        if (!CONTAIN_SCHEDULED_POOL_LEAK) {
+            XposedBridge.log(TAG + "executor attribution mode: all pool mutation disabled");
+            return;
+        }
+
+        // 3) SAFETY NET. allowCoreThreadTimeOut can orphan a queued task only if
+        //    its delay/period exceeds the keep-alive AND every worker retires
+        //    first. A pool that ever schedules PERIODIC work must therefore keep
+        //    a live worker: revert the timeout on it and never trim it again.
+        //    This is what makes widening SCHEDULED_POOL_TRIM_OWNER_PREFIXES safe
+        //    — a periodic task can never be starved by our change. (The default
+        //    allowlist, io.bidmachine, schedules no periodic work at all, so it
+        //    is safe even without this net; the net exists for broadening.)
+        installPeriodicBackoffGuard("scheduleAtFixedRate");
+        installPeriodicBackoffGuard("scheduleWithFixedDelay");
+    }
+
+    private void installScheduledFactoryProbe(
+            final String method, Class<?>... parameterTypes) {
+        try {
+            Object[] signature = new Object[parameterTypes.length + 1];
+            for (int i = 0; i < parameterTypes.length; i++) {
+                signature[i] = parameterTypes[i];
+            }
+            signature[parameterTypes.length] = new XC_MethodHook() {
                 protected void afterHookedMethod(MethodHookParam p) {
                     try {
-                        Object value = XposedHelpers.getObjectField(
-                            p.thisObject, "executorService");
-                        if (!(value instanceof ScheduledThreadPoolExecutor)) {
-                            XposedBridge.log(TAG
-                                + "BidMachine GAM executor guard skipped unexpected type="
-                                + (value == null ? "null" : value.getClass().getName()));
+                        ScheduledThreadPoolExecutor pool =
+                            unwrapScheduledExecutor(p.getResult());
+                        if (pool == null) {
+                            XposedBridge.log(TAG + "POOL FACTORY unwrap FAILED method="
+                                + method + " result="
+                                + (p.getResult() == null ? "null"
+                                   : p.getResult().getClass().getName()));
                             return;
                         }
-
-                        configureBidMachineExecutor(
-                            (ScheduledThreadPoolExecutor) value, "owner-after-hook");
+                        String owner = scheduledExecutorOwner();
+                        ThreadFactory factory = pool.getThreadFactory();
+                        int factoryHit;
+                        boolean logFactory;
+                        synchronized (scheduledPoolLock) {
+                            factoryHit = ++scheduledFactoryProbeHits;
+                            logFactory = scheduledFactoryLogs < MAX_EXECUTOR_CREATE_LOGS;
+                            if (logFactory) scheduledFactoryLogs++;
+                        }
+                        if (logFactory) {
+                            XposedBridge.log(TAG + "POOL FACTORY"
+                                + " method=Executors." + method
+                                + " hit=" + factoryHit
+                                + " id=" + Integer.toHexString(System.identityHashCode(pool))
+                                + " prefix=" + threadFactoryPrefix(factory)
+                                + " owner=" + owner
+                                + " wrapper=" + (p.getResult() == null ? "null"
+                                   : p.getResult().getClass().getName()));
+                        }
+                        recordExecutorPool(
+                            "STPE", pool, owner, "Executors." + method);
+                        maybeLogPoolMonitor();
                     } catch (Throwable t) {
-                        XposedBridge.log(TAG + "BidMachine GAM executor guard note: " + t);
+                        XposedBridge.log(TAG + "POOL FACTORY note method="
+                            + method + " err=" + t);
                     }
                 }
-            });
-            XposedBridge.log(TAG + "BidMachine GAM executor guard installed");
+            };
+            XposedHelpers.findAndHookMethod(
+                Executors.class, method, signature);
+            XposedBridge.log(TAG + "POOL FACTORY probe installed method=" + method
+                + " args=" + parameterTypes.length);
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "BidMachine GAM executor hook FAILED: " + t);
+            XposedBridge.log(TAG + "POOL FACTORY hook FAILED method=" + method
+                + " args=" + parameterTypes.length + " err=" + t);
         }
     }
 
-    private static void configureBidMachineExecutor(ScheduledThreadPoolExecutor executor,
-                                                     String source) {
-        int configured;
-        synchronized (bidMachinePoolLock) {
-            if (!configuredBidMachinePools.add(executor)) return;
-            configured = ++bidMachinePoolsConfigured;
+    private static ScheduledThreadPoolExecutor unwrapScheduledExecutor(Object value) {
+        Object current = value;
+        for (int depth = 0; depth < 4 && current != null; depth++) {
+            if (current instanceof ScheduledThreadPoolExecutor) {
+                return (ScheduledThreadPoolExecutor) current;
+            }
+            try {
+                Object nested = XposedHelpers.getObjectField(current, "e");
+                if (nested == current) break;
+                current = nested;
+            } catch (Throwable ignored) {
+                return null;
+            }
         }
-        executor.setKeepAliveTime(
-            BIDMACHINE_IDLE_THREAD_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        executor.allowCoreThreadTimeOut(true);
-        executor.setRemoveOnCancelPolicy(true);
-        if (configured <= 3 || configured % 50 == 0) {
-            XposedBridge.log(TAG
-                + "BidMachine GAM idle-core timeout configured pools=" + configured
-                + " core=" + executor.getCorePoolSize()
-                + " timeoutSec=" + BIDMACHINE_IDLE_THREAD_TIMEOUT_SECONDS
-                + " source=" + source);
+        return null;
+    }
+
+    private static void runExecutorTelemetryCanary() {
+        int ordinaryBefore;
+        int scheduledBefore;
+        int factoryBefore;
+        synchronized (scheduledPoolLock) {
+            ordinaryBefore = ordinaryPoolsSeen;
+            scheduledBefore = scheduledPoolsSeen;
+            factoryBefore = scheduledFactoryProbeHits;
+        }
+        java.util.ArrayList<ExecutorService> pools = new java.util.ArrayList<>();
+        try {
+            pools.add(new ThreadPoolExecutor(
+                1, 1, 1L, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>()));
+            pools.add(Executors.newFixedThreadPool(1));
+            pools.add(Executors.newCachedThreadPool());
+            pools.add(Executors.newSingleThreadExecutor());
+            pools.add(new ScheduledThreadPoolExecutor(1));
+            pools.add(Executors.newScheduledThreadPool(1));
+            pools.add(Executors.newSingleThreadScheduledExecutor());
+            ThreadFactory canaryFactory = Executors.defaultThreadFactory();
+            pools.add(Executors.newScheduledThreadPool(1, canaryFactory));
+            pools.add(Executors.newSingleThreadScheduledExecutor(canaryFactory));
+            for (ExecutorService pool : pools) {
+                pool.submit(new Runnable() {
+                    public void run() {}
+                }).get(2L, TimeUnit.SECONDS);
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "POOL CANARY construction FAILED: " + t);
+        } finally {
+            for (ExecutorService pool : pools) {
+                try { pool.shutdownNow(); } catch (Throwable ignored) {}
+            }
+        }
+        int ordinaryDelta;
+        int scheduledDelta;
+        int factoryDelta;
+        synchronized (scheduledPoolLock) {
+            ordinaryDelta = ordinaryPoolsSeen - ordinaryBefore;
+            scheduledDelta = scheduledPoolsSeen - scheduledBefore;
+            factoryDelta = scheduledFactoryProbeHits - factoryBefore;
+        }
+        XposedBridge.log(TAG + "POOL CANARY ordinaryDelta=" + ordinaryDelta
+            + " expected=4 scheduledDelta=" + scheduledDelta + " expected=5"
+            + " factoryDelta=" + factoryDelta + " expected=4"
+            + ((ordinaryDelta == 4 && scheduledDelta == 5 && factoryDelta == 4)
+               ? " PASS" : " FAIL"));
+    }
+
+    private void installPeriodicBackoffGuard(final String method) {
+        try {
+            XposedBridge.hookAllMethods(
+                ScheduledThreadPoolExecutor.class, method, new XC_MethodHook() {
+                    protected void beforeHookedMethod(MethodHookParam p) {
+                        try {
+                            if (p.thisObject instanceof ScheduledThreadPoolExecutor) {
+                                backOffPeriodicPool(
+                                    (ScheduledThreadPoolExecutor) p.thisObject);
+                            }
+                        } catch (Throwable t) { /* must never break scheduling */ }
+                    }
+                });
+            XposedBridge.log(TAG + "periodic-backoff guard installed for " + method);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "periodic-backoff guard " + method + " note: " + t);
         }
     }
 
+    private static boolean ownerIsTrimTarget(String owner) {
+        if (owner == null) return false;
+        for (String prefix : SCHEDULED_POOL_TRIM_OWNER_PREFIXES) {
+            if (owner.startsWith(prefix)) return true;
+        }
+        return false;
+    }
+
+    // Let idle CORE workers of an ad-owned pool retire. Task semantics are
+    // unchanged: only workers sitting idle with an empty queue for the keep-alive
+    // retire, and ScheduledThreadPoolExecutor recreates one on the next submit.
+    private static void trimScheduledPool(ScheduledThreadPoolExecutor pool, String owner) {
+        // corePoolSize == 0 + allowCoreThreadTimeOut is the ONE genuinely unsafe
+        // combination (OpenJDK JDK-7091003 / JDK-8022642: a queued task can be
+        // orphaned or hot-spin). It is also pointless — a zero-core pool has no
+        // core workers to reclaim. Skip it. With corePoolSize >= 1 the OpenJDK/
+        // AOSP getTask/ensurePrestart/processWorkerExit guards keep at least one
+        // worker whenever the queue is non-empty, so even periodic tasks are not
+        // orphaned; that is why widening the owner allowlist is safe.
+        if (pool.getCorePoolSize() < 1) return;
+        synchronized (scheduledPoolLock) {
+            if (periodicPools.contains(pool)) return;   // known periodic — leave it alone
+            if (trimmedPools.contains(pool)) return;    // already trimmed
+            try {
+                // Keep this mutation under the same lock as periodic backoff.
+                // Otherwise a first periodic schedule could disable timeout and
+                // race with this path re-enabling it after periodicPools is set.
+                pool.setKeepAliveTime(
+                    SCHEDULED_POOL_IDLE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                pool.allowCoreThreadTimeOut(true);
+                pool.setRemoveOnCancelPolicy(true);
+                trimmedPools.add(pool);
+                int trimmed = ++scheduledPoolsTrimmed;
+                if (trimmed <= 5 || trimmed % 50 == 0) {
+                    XposedBridge.log(TAG
+                        + "scheduled-pool idle-core timeout applied owner=" + owner
+                        + " core=" + pool.getCorePoolSize()
+                        + " timeoutSec=" + SCHEDULED_POOL_IDLE_TIMEOUT_SECONDS
+                        + " trimmedPools=" + trimmed);
+                }
+            } catch (Throwable t) {
+                // Best-effort rollback if a later setter failed after timeout
+                // was enabled. Do not record a partially configured pool.
+                try { pool.allowCoreThreadTimeOut(false); } catch (Throwable ignored) {}
+                trimmedPools.remove(pool);
+                XposedBridge.log(TAG
+                    + "scheduled-pool trim note owner=" + owner + " err=" + t);
+            }
+        }
+    }
+
+    private static void backOffPeriodicPool(ScheduledThreadPoolExecutor pool) {
+        synchronized (scheduledPoolLock) {
+            if (!periodicPools.add(pool)) return;       // already handled
+            boolean wasTrimmed = trimmedPools.remove(pool);
+            int backedOff = ++scheduledPoolsBackedOff;
+            if (wasTrimmed) {
+                try {
+                    pool.allowCoreThreadTimeOut(false); // keep a worker for periodic work
+                } catch (Throwable t) { /* best effort */ }
+                XposedBridge.log(TAG
+                    + "scheduled-pool periodic task detected -> idle-core timeout"
+                    + " REVERTED to protect periodic work backedOff=" + backedOff);
+            }
+        }
+    }
+
+    private static void recordExecutorPool(
+            String type, ThreadPoolExecutor pool, String owner, String origin) {
+        int observed;
+        boolean logCreate;
+        synchronized (scheduledPoolLock) {
+            if (!markExecutorObserved(pool)) return;
+            Map<String, Integer> counts;
+            if ("STPE".equals(type)) {
+                scheduledPoolsSeen++;
+                counts = scheduledPoolOwnerCounts;
+            } else {
+                ordinaryPoolsSeen++;
+                counts = ordinaryPoolOwnerCounts;
+            }
+            Integer prior = counts.get(owner);
+            observed = prior == null ? 1 : prior.intValue() + 1;
+            if (prior != null || counts.size() < 500) {
+                counts.put(owner, Integer.valueOf(observed));
+            }
+            logCreate = executorCreateLogs < MAX_EXECUTOR_CREATE_LOGS;
+            if (logCreate) executorCreateLogs++;
+        }
+        if (logCreate) {
+            ThreadFactory factory = pool.getThreadFactory();
+            String id = Integer.toHexString(System.identityHashCode(pool));
+            String prefix = threadFactoryPrefix(factory);
+            XposedBridge.log(TAG + "POOL CREATE"
+                + " type=" + type
+                + " id=" + id
+                + " prefix=" + prefix
+                + " owner=" + owner
+                + " origin=" + origin
+                + " class=" + pool.getClass().getName()
+                + " core=" + pool.getCorePoolSize()
+                + " max=" + pool.getMaximumPoolSize()
+                + " keepAliveMs=" + pool.getKeepAliveTime(TimeUnit.MILLISECONDS)
+                + " allowCoreTimeout=" + pool.allowsCoreThreadTimeOut()
+                + " queue=" + pool.getQueue().getClass().getName()
+                + " factory=" + (factory == null ? "null" : factory.getClass().getName())
+                + " ownerCount=" + observed);
+            XposedBridge.log(TAG + "POOL STACK"
+                + " type=" + type
+                + " id=" + id
+                + " prefix=" + prefix
+                + " owner=" + owner
+                + " origin=" + origin
+                + " frames=" + creatorStackSnapshot());
+        }
+    }
+
+    // Caller holds scheduledPoolLock.
+    private static boolean markExecutorObserved(ThreadPoolExecutor pool) {
+        Iterator<WeakReference<ThreadPoolExecutor>> iterator =
+            observedExecutorPools.iterator();
+        while (iterator.hasNext()) {
+            ThreadPoolExecutor observed = iterator.next().get();
+            if (observed == null) {
+                iterator.remove();
+            } else if (observed == pool) {
+                return false;
+            }
+        }
+        observedExecutorPools.add(new WeakReference<ThreadPoolExecutor>(pool));
+        return true;
+    }
+
+    private static String threadFactoryPrefix(ThreadFactory factory) {
+        if (factory == null) return "null";
+        try {
+            Object value = XposedHelpers.getObjectField(factory, "namePrefix");
+            if (value instanceof String) return (String) value;
+        } catch (Throwable ignored) {}
+        return "-";
+    }
+
+    private static String creatorStackSnapshot() {
+        StringBuilder out = new StringBuilder();
+        int kept = 0;
+        for (StackTraceElement frame : Thread.currentThread().getStackTrace()) {
+            if (isInfrastructureFrame(frame.getClassName())) continue;
+            if (kept++ > 0) out.append('>');
+            out.append(frame.getClassName()).append('#').append(frame.getMethodName())
+                .append(':').append(frame.getLineNumber());
+            if (kept >= 10) break;
+        }
+        return out.length() == 0 ? "unknown" : out.toString();
+    }
+
+    // Owner = the first application/SDK frame that created the pool, skipping the
+    // JDK executor plumbing, the Android/ART runtime, and every Xposed/LSPosed
+    // trampoline frame. The v1.3 probe stopped at "LSPHooker_#constructor"
+    // because those synthetic frames were not skipped — that is fixed here.
     private static String scheduledExecutorOwner() {
         StackTraceElement[] stack = Thread.currentThread().getStackTrace();
-        String fallback = "unknown";
         for (StackTraceElement frame : stack) {
             String name = frame.getClassName();
-            if (name.equals(
-                    "io.bidmachine.ads.networks.gam.GAMLoader$GAMTaskLoader")) {
-                return name + "#" + frame.getMethodName();
-            }
-            if (name.startsWith("java.") || name.startsWith("android.")
-                    || name.startsWith("dalvik.") || name.startsWith("de.robv.")
-                    || name.startsWith("org.lsposed.")
-                    || name.startsWith("com.recon.talsecbypass.")
-                    || name.contains("XposedBridge")
-                    || name.contains("XposedHelpers")
-                    || name.contains("XC_MethodHook")) {
-                continue;
-            }
-            if ("unknown".equals(fallback)) {
-                fallback = name + "#" + frame.getMethodName();
-            }
+            if (isInfrastructureFrame(name)) continue;
+            return name + "#" + frame.getMethodName();
         }
-        return fallback;
+        return "unknown";
     }
 
-    private static void logScheduledPoolOwner(String owner) {
-        int observed;
-        synchronized (bidMachinePoolLock) {
-            Integer prior = scheduledPoolOwnerCounts.get(owner);
-            observed = prior == null ? 1 : prior.intValue() + 1;
-            if (prior != null || scheduledPoolOwnerCounts.size() < 100) {
-                scheduledPoolOwnerCounts.put(owner, Integer.valueOf(observed));
+    private static boolean isInfrastructureFrame(String name) {
+        if (name == null) return true;
+        return name.startsWith("java.")
+            || name.startsWith("javax.")
+            || name.startsWith("jdk.")
+            || name.startsWith("sun.")
+            || name.startsWith("dalvik.")
+            || name.startsWith("libcore.")
+            || name.startsWith("com.android.internal.")
+            || name.startsWith("de.robv.")
+            || name.startsWith("org.lsposed.")
+            || name.startsWith("io.github.libxposed.")
+            || name.startsWith("com.recon.talsecbypass.")
+            || name.contains("LSPHooker")            // LSPosed method trampoline
+            || name.contains("XposedBridge")
+            || name.contains("XposedHelpers")
+            || name.contains("XC_MethodHook");
+    }
+
+    // Process-wide thread-count + pool summary, piggybacked on pool creation and
+    // throttled to POOL_MONITOR_INTERVAL_MS. This is the visible thread-surge
+    // tracker in logcat: grep "POOL MONITOR" to watch threads plateau.
+    private static void maybeLogPoolMonitor() {
+        long now = System.currentTimeMillis();
+        synchronized (scheduledPoolLock) {
+            if (now - lastPoolMonitorMs < POOL_MONITOR_INTERVAL_MS) return;
+            lastPoolMonitorMs = now;
+            XposedBridge.log(TAG + "POOL MONITOR threads=" + currentThreadCount()
+                + " ordinaryPoolsSeen=" + ordinaryPoolsSeen
+                + " scheduledPoolsSeen=" + scheduledPoolsSeen
+                + " trimmed=" + scheduledPoolsTrimmed
+                + " periodicBackedOff=" + scheduledPoolsBackedOff
+                + " topTpeOwners=[" + topOwnersSnapshot(ordinaryPoolOwnerCounts) + "]"
+                + " topStpeOwners=[" + topOwnersSnapshot(scheduledPoolOwnerCounts) + "]");
+        }
+    }
+
+    // Top three owners by pool-creation count. Caller must hold scheduledPoolLock.
+    private static String topOwnersSnapshot(Map<String, Integer> ownerCounts) {
+        String bestA = null;
+        String bestB = null;
+        String bestC = null;
+        int ca = -1;
+        int cb = -1;
+        int cc = -1;
+        for (Map.Entry<String, Integer> e : ownerCounts.entrySet()) {
+            int c = e.getValue().intValue();
+            String k = e.getKey();
+            if (c > ca) {
+                cc = cb; bestC = bestB; cb = ca; bestB = bestA; ca = c; bestA = k;
+            } else if (c > cb) {
+                cc = cb; bestC = bestB; cb = c; bestB = k;
+            } else if (c > cc) {
+                cc = c; bestC = k;
             }
         }
-        if (observed == 1 || observed % 50 == 0) {
-            XposedBridge.log(TAG + "scheduled executor owner=" + owner
-                + " count=" + observed);
+        StringBuilder sb = new StringBuilder();
+        if (bestA != null) sb.append(shortOwner(bestA)).append("=").append(ca);
+        if (bestB != null) sb.append(", ").append(shortOwner(bestB)).append("=").append(cb);
+        if (bestC != null) sb.append(", ").append(shortOwner(bestC)).append("=").append(cc);
+        return sb.length() == 0 ? "none" : sb.toString();
+    }
+
+    private static String shortOwner(String owner) {
+        if (owner == null) return "null";
+        int hash = owner.indexOf('#');
+        return hash > 0 ? owner.substring(0, hash) : owner;
+    }
+
+    // Live thread count of THIS process from /proc/self/status (exact, cheap).
+    // Falls back to the root ThreadGroup estimate if /proc is unreadable.
+    private static int currentThreadCount() {
+        java.io.BufferedReader r = null;
+        try {
+            r = new java.io.BufferedReader(new java.io.FileReader("/proc/self/status"));
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (line.startsWith("Threads:")) {
+                    return Integer.parseInt(line.substring(8).trim());
+                }
+            }
+        } catch (Throwable t) {
+            // fall through to the ThreadGroup estimate
+        } finally {
+            if (r != null) { try { r.close(); } catch (Throwable ignored) {} }
+        }
+        try {
+            ThreadGroup g = Thread.currentThread().getThreadGroup();
+            while (g != null && g.getParent() != null) g = g.getParent();
+            return g == null ? -1 : g.activeCount();
+        } catch (Throwable t) {
+            return -1;
         }
     }
 

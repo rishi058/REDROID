@@ -641,6 +641,36 @@ gr.nikolasspyr.integritycheck
 current stack into Play Store caused an early Android `Resources` NPE. It is not
 required for Target-App's GMS attestation request.
 
+Target-list exclusion and false Vending spoof flags are necessary but not
+sufficient for the stock `inject-s` PIF binary. Its `preAppSpecialize()` still
+classifies Play Store as GMS, requests `FORCE_DENYLIST_UNMOUNT`, and loads the
+companion payload before those flags are evaluated. The retained ReDroid build
+must apply
+`KernelSU_setup/coolify/patches/playintegrityfix-redroid-no-vending.patch`.
+That patch exits and unloads PIF as soon as the process name is
+`com.android.vending`; only the exact `com.google.android.gms.unstable`
+DroidGuard process receives the forced unmount and payload.
+
+The hardened artifact is identified as:
+
+```text
+PlayIntegrityFix_v4.7-1-redroid.2-no-vending.zip
+version=v4.7-1-redroid.2
+versionCode=47102
+sha256=f4e54d7e0de02579fb77056a34dec3a91b6a0b50c4a004640fa3f6b4488d9761
+```
+
+Validate every rebuilt archive before staging it:
+
+```powershell
+python KernelSU_setup/coolify/validate-pif-no-vending.py `
+  win-kernelSU-setup/artifacts/integrity/PlayIntegrityFix_v4.7-1-redroid.2-no-vending.zip
+```
+
+The validator requires the early-skip marker in both native ABIs, rejects an
+upstream `updateJson`, and rejects BOM/CRLF module files. KernelSU previously
+failed to execute a Windows-repacked module containing CRLF shell scripts.
+
 Final `pif.prop` runtime switches are conservative:
 
 ```properties
@@ -1203,13 +1233,19 @@ are authorized — keeping 5555 off the public internet is the control that matt
 Play Store repeatedly failed in `ActivityThread.handleBindApplication()` with a
 `Resources.getConfiguration()` null dereference.
 
-**Fix and boundary**
+**Initial partial fix**
 
 Removed Play Store from TEESimulator targets and disabled PIF's per-process
 runtime spoof switches. The shortest authorized test path did not require Play
 Store: the retained official Play-signed Target-App splits were installed from
 the host, followed by PairIPFix and the unchanged TalsecKill APK. Target-App's v3
 request then returned HTTP 200.
+
+This did not fully exclude Play Store from PIF. The stock native binary still
+entered Vending before reading the false runtime switches, requested a denylist
+namespace unmount, and loaded its companion payload. A later production run
+therefore reproduced the same `Resources.getConfiguration()` crash loop even
+with the documented target list and switches.
 
 ### Play Store could not open its own `Phonesky.apk`
 
@@ -1253,6 +1289,23 @@ depends on PIF's GMS/DroidGuard injection. Restore the reviewed PIF configuratio
 by removing `/data/adb/pif_script_only` and performing a full VPS reboot. Treat
 the marker as a bounded Play Store crash diagnostic, not as the fix for Play
 catalog eligibility or another app's integrity flow.
+
+**Final root fix**
+
+Use the hardened `v4.7-1-redroid.2` native module. It returns from
+`preAppSpecialize()` for `com.android.vending` before any forced unmount,
+companion IPC, config loading, or hook setup. It also moves
+`FORCE_DENYLIST_UNMOUNT` after exact selection of
+`com.google.android.gms.unstable`, avoiding namespace changes in unrelated GMS
+processes. Vending spoof capabilities are intentionally unavailable in this
+ReDroid build; DroidGuard injection remains enabled.
+
+Stage and validate on `redroid-experimental` first. Production activation must
+use a maintenance-window VPS reboot; do not treat a Coolify/Docker restart as a
+reliable KernelSU/Zygisk activation boundary. After boot, verify that Play Store
+retains a PID, its `Phonesky.apk` remains visible through the process root, no
+PIF native mapping exists in Vending, and PIF remains mapped in
+`com.google.android.gms.unstable`.
 
 ### Certificate existed under `/system` but TLS interception failed
 

@@ -173,10 +173,15 @@ The normal configuration applies only these reaction/stability guards:
    requests remain real.
 8. Banner and MREC auto-refresh requests are rewritten from enabled to disabled;
    their initial mount load remains enabled.
-9. An experimental BidMachine GAM guard can make a positively attributed loader
-   executor's idle core workers expire after 30 seconds. Production v1.3 has not
-   produced a configured-pool log, so this timeout must currently be treated as
-   inactive.
+9. (v1.4) Ad-SDK scheduled-pool thread-leak containment. Every
+   `ScheduledThreadPoolExecutor` construction in the process is intercepted; the
+   creating SDK is attributed from the live stack (skipping the LSPosed
+   `LSPHooker` trampoline that blocked v1.3), and pools owned by an ad package on
+   `SCHEDULED_POOL_TRIM_OWNER_PREFIXES` (default `io.bidmachine.`) get
+   `allowCoreThreadTimeOut(true)` + a 60 s keep-alive so their idle core workers
+   retire instead of parking forever. A `scheduleAtFixedRate`/`scheduleWithFixedDelay`
+   guard reverts the timeout on any pool that takes periodic work, so the owner
+   list can be widened to other ad SDKs safely.
 
 Expected normal log lines include:
 
@@ -186,7 +191,12 @@ Expected normal log lines include:
 [TalsecKill] AppLovin loadInterstitial limiter installed
 [TalsecKill] AppLovin loadRewardedAd limiter installed
 [TalsecKill] AppLovin auto-refresh guard installed
-[TalsecKill] BidMachine GAM executor guard installed
+[TalsecKill] scheduled-pool constructor probe installed
+[TalsecKill] periodic-backoff guard installed for scheduleAtFixedRate
+[TalsecKill] periodic-backoff guard installed for scheduleWithFixedDelay
+[TalsecKill] scheduled pool NEW owner=io.bidmachine...TaskExecutorImpl#<init> trimTarget=true
+[TalsecKill] scheduled-pool idle-core timeout applied owner=io.bidmachine... trimmedPools=1
+[TalsecKill] POOL MONITOR threads=NNN scheduledPoolsSeen=N trimmed=M periodicBackedOff=K topOwners=[...]
 [TalsecKill] reaction guards installed (native RASP active, threat channel desynced)
 ```
 
@@ -212,15 +222,28 @@ Compare fresh-process thread count and RSS against an unmodified run. If a
 future AppLovin bridge class changes, the hook logs a failure and leaves the
 original SDK behavior intact.
 
-ART thread-dump analysis identified BidMachine's `GAMLoader$GAMTaskLoader` as a
-strong source match for the dominant anonymous scheduled pools. Each loader
-creates a 2–4 core scheduled executor, submits only immediate work, and has no
-shutdown path. The module is designed to keep the executor and submitted work
-intact while enabling a 30-second idle-core timeout only after exact owner
-attribution. In the production v1.3 A/B, the direct owner hook did not fire and
-generic constructor telemetry saw only `LSPHooker_#constructor`; no timeout was
-observed applying. Do not claim this guard is active without a
-`BidMachine GAM idle-core timeout configured` log.
+### Scheduled-pool thread-leak containment (v1.4)
+
+ART thread-dump analysis identified BidMachine's scheduled pools as the dominant
+anonymous `pool-*` leak. Decompiled source (`rev-eng/apk-extractor`) confirmed
+**two** owners, both creating `Executors.newScheduledThreadPool(max(2,min(CPU-1,4)))`,
+submitting one-shot work, and never calling `shutdown()`:
+`io.bidmachine.ads.networks.gam_dynamic.TaskExecutorImpl` (the one the app
+exercises) and `io.bidmachine.ads.networks.gam.GAMLoader$GAMTaskLoader`. v1.3
+failed for two reasons now fixed: it hooked the wrong package's field, and its
+stack walk stopped at the LSPosed `LSPHooker_#constructor` trampoline.
+
+v1.4 hooks the `ScheduledThreadPoolExecutor` **constructor** (the catch-all —
+both `Executors.new…` and direct `new` route through it), attributes the owner by
+skipping JDK/runtime/Xposed/`LSPHooker` frames, and for ad-owned pools applies
+`setKeepAliveTime(60s)` + `allowCoreThreadTimeOut(true)` +
+`setRemoveOnCancelPolicy(true)`. Safe because the last worker never abandons a
+queued task (`ThreadPoolExecutor.getTask` guard `wc>1 || queue.isEmpty()`),
+`corePoolSize` stays ≥ 1, and any pool that takes a periodic task is auto-reverted.
+Confirm activity via the `scheduled-pool idle-core timeout applied` and
+`POOL MONITOR threads=…` lines; widen `SCHEDULED_POOL_TRIM_OWNER_PREFIXES` only
+after a `scheduled pool NEW owner=…` line confirms another significant one-shot
+owner.
 
 The earlier promise wrapper that logged vault values and cryptograms, including
 its secret-priming helper, has been removed from source. The module must never
