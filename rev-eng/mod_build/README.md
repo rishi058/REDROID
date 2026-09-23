@@ -245,9 +245,18 @@ Confirm activity via the `scheduled-pool idle-core timeout applied` and
 after a `scheduled pool NEW owner=…` line confirms another significant one-shot
 owner.
 
-The earlier promise wrapper that logged vault values and cryptograms, including
-its secret-priming helper, has been removed from source. The module must never
-write authorization values, nonces, cryptograms, or vault values to logcat.
+The earlier React-Native promise wrapper that logged `getSecret`/`getCryptogram`
+vault values was removed from **this** (TalsecKill) module because 26.1 is
+Kotlin/Compose and no longer exposes that bridge. Response-key recovery now lives
+in the separate `dw26gate` probe (`gate/`), which intentionally captures 26.1's
+live content-decryption keys at `C5.c.a(ciphertext, password)` — the outer
+`np_lelo` `fileInfo` key and the inner derived `url` key — plus request-side keys
+at the encrypt twin `C5.c.b(plaintext, password)`, to the app's private
+`cache/dw26gate-keys.jsonl` plus `[DW26Gate][key]` logcat lines. PairIP hides the
+key-producing code (`E5.a`/`E5.d`) inside the `pairipcore` native VM, so this
+runtime capture at the crypto primitive is the only reliable recovery path. That output is
+local-only research material: keep it out of git and delete it when the analysis
+is done.
 
 ### Passive integrity A/B mode
 

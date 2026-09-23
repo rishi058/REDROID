@@ -1,0 +1,6 @@
+id=dw26_gate_probe
+name=DiskWala 26.2 Gate Probe (system APK)
+version=0.6
+versionCode=6
+author=local
+description=Preloads the separate scoped LSPosed probe APK; no native security service changes

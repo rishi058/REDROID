@@ -1,0 +1,9 @@
+{
+  "enabled": false,
+  "responses": {
+    "attest/verify": {
+      "status": 200,
+      "body": {}
+    }
+  }
+}

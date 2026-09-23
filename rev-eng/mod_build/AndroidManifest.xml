@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.recon.talsecbypass"
-    android:versionCode="8" android:versionName="1.5">
+    android:versionCode="11" android:versionName="1.6.2-diagnostic">
     <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="35"/>
     <application android:label="TalsecKill" android:hasCode="true">
         <meta-data android:name="xposedmodule" android:value="true"/>
-        <meta-data android:name="xposeddescription" android:value="Scoped target stability, AppLovin resource guard, and ad-SDK scheduled-pool thread-leak containment"/>
+        <meta-data android:name="xposeddescription" android:value="DiskWala v26.1 bounded integrity, bridge, network, and device-signal diagnostics"/>
         <meta-data android:name="xposedminversion" android:value="82"/>
         <meta-data android:name="xposedscope" android:value="com.target-appapp"/>
     </application>

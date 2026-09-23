@@ -1,0 +1,6 @@
+id=diskwala_system
+name=DiskWala System Preload
+version=1
+versionCode=1
+author=local
+description=Preloads the exact Play-signed DiskWala split APK set as a system app

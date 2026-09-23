@@ -1,0 +1,5 @@
+# Merge these with the existing TrickyStore target list.
+# Do not delete unrelated existing targets.
+com.android.vending
+com.google.android.gms!
+com.diskwalaapp!

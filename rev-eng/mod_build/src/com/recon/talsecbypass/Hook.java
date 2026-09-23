@@ -6,6 +6,7 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 import java.lang.ref.WeakReference;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.Collections;
@@ -37,6 +38,22 @@ public class Hook implements IXposedHookLoadPackage {
     private static final String SPOOF_DEVICE_ID = "accepted-device-id";
     private static final String DEVICE_ID_PLACEHOLDER_PREFIX = "accepted-device-";
     private static final String PLUGIN = "com.talsecreactnativesecurityplugin.TalsecReactNativeSecurityPluginModule";
+
+    // v26.1 diagnostics. This build observes the genuine decision path and does
+    // not install any of the mutation/suppression hooks below. PairIPFix remains
+    // a separate LSPosed module and is unaffected.
+    private static final boolean DIAGNOSTIC_ONLY = true;
+    private static final int MAX_DIAGNOSTIC_LINES = 500;
+    private static final int MAX_DISCOVERED_CLASSES = 300;
+    private static final int MAX_DIAGNOSTIC_TEXT = 320;
+    private static final AtomicInteger diagnosticSequence = new AtomicInteger();
+    private static final AtomicInteger discoveredClassCount = new AtomicInteger();
+    private static final Object diagnosticLock = new Object();
+    private static final Set<String> diagnosticKeys = new LinkedHashSet<>();
+    private static final Set<String> installedDiagnosticHooks = new LinkedHashSet<>();
+    private static final ThreadLocal<Boolean> diagnosticGuard = new ThreadLocal<>();
+    private static final Map<Object, String> pendingPromises =
+        Collections.synchronizedMap(new WeakHashMap<Object, String>());
 
     // ── core behaviour toggles ───────────────────────────────────────────────
     private static final boolean PASSIVE_INTEGRITY_TEST  = false;
@@ -174,7 +191,15 @@ public class Hook implements IXposedHookLoadPackage {
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) throws Throwable {
         if (!TARGET_PACKAGE.equals(lp.packageName)) return;
         final ClassLoader cl = lp.classLoader;
-        XposedBridge.log(TAG + "loaded in " + lp.packageName);
+
+        if (DIAGNOSTIC_ONLY) {
+            installDiagnostics(cl);
+            return;
+        }
+
+        // Legacy v24/v25 Talsec logs and hooks are intentionally unreachable in
+        // the v26.1 diagnostic build. Retain them only for later A/B comparison.
+        XposedBridge.log(TAG + "legacy hook mode loaded in " + lp.packageName);
 
         if (PASSIVE_INTEGRITY_TEST) {
             XposedBridge.log(TAG + "passive integrity test: zero hooks installed");
@@ -1042,6 +1067,714 @@ public class Hook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             return -1;
         }
+    }
+
+    // ── v26.1 bounded diagnostics ────────────────────────────────────────────
+    private void installDiagnostics(final ClassLoader initialLoader) {
+        diagOnce("BOOT", "start", "diagnostic-only build active loader="
+            + loaderName(initialLoader) + " target=" + TARGET_PACKAGE);
+        logDeviceSnapshot();
+        hookApplicationAttach(initialLoader);
+        hookClassDiscovery();
+        hookPackageManagerDiagnostics(initialLoader);
+        hookSettingsDiagnostics(initialLoader);
+        hookRootAndDebugDiagnostics(initialLoader);
+        hookUiDiagnostics(initialLoader);
+        hookExitDiagnostics(initialLoader);
+        installKnownDiagnostics(initialLoader, "initial");
+    }
+
+    private void hookApplicationAttach(final ClassLoader initialLoader) {
+        try {
+            Class<?> context = XposedHelpers.findClass("android.content.Context", null);
+            XposedHelpers.findAndHookMethod("android.app.Application", null, "attach",
+                context, new XC_MethodHook() {
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        try {
+                            Object ctx = p.args[0];
+                            ClassLoader actual = (ClassLoader) XposedHelpers.callMethod(
+                                ctx, "getClassLoader");
+                            diagOnce("CLASS", "application-attach-" + loaderName(actual),
+                                "Application.attach actualLoader=" + loaderName(actual)
+                                + " initialLoader=" + loaderName(initialLoader));
+                            installKnownDiagnostics(actual, "Application.attach");
+                        } catch (Throwable t) {
+                            diag("EX", "Application.attach diagnostics " + throwableShape(t));
+                        }
+                    }
+                });
+            diagOnce("CLASS", "attach-hook", "Application.attach class-loader probe installed");
+        } catch (Throwable t) {
+            diagOnce("EX", "attach-hook", "Application.attach hook failed " + throwableShape(t));
+        }
+    }
+
+    private void hookClassDiscovery() {
+        try {
+            XposedBridge.hookAllMethods(ClassLoader.class, "loadClass", new XC_MethodHook() {
+                protected void afterHookedMethod(MethodHookParam p) {
+                    if (p.getThrowable() != null || !(p.getResult() instanceof Class<?>)) return;
+                    if (Boolean.TRUE.equals(diagnosticGuard.get())) return;
+                    try {
+                        diagnosticGuard.set(Boolean.TRUE);
+                        Class<?> loaded = (Class<?>) p.getResult();
+                        String name = loaded.getName();
+                        if (!isFrameworkClass(name)) {
+                            int ordinal = discoveredClassCount.incrementAndGet();
+                            boolean interesting = isInterestingClassName(name);
+                            if (interesting) {
+                                diagOnce("CLASS", "load-" + name, "loaded=" + name
+                                    + " loader=" + loaderName(loaded.getClassLoader())
+                                    + " ordinal=" + ordinal);
+                            }
+                            if (ordinal <= MAX_DISCOVERED_CLASSES || interesting) {
+                                inspectSemanticMethods(loaded);
+                            }
+                        } else if (isInterestingClassName(name)) {
+                            diagOnce("CLASS", "load-" + name, "loaded=" + name
+                                + " loader=" + loaderName(loaded.getClassLoader()));
+                        }
+                        installLoadedClassDiagnostics(loaded);
+                    } catch (Throwable t) {
+                        diagOnce("EX", "class-load-" + t.getClass().getName(),
+                            "class-load observer " + throwableShape(t));
+                    } finally {
+                        diagnosticGuard.remove();
+                    }
+                }
+            });
+            diagOnce("CLASS", "loadclass-hook", "ClassLoader.loadClass discovery installed");
+        } catch (Throwable t) {
+            diagOnce("EX", "loadclass-hook", "ClassLoader discovery failed " + throwableShape(t));
+        }
+
+        // Do not hook BaseDexClassLoader constructors here. LSPosed creates
+        // helper loaders while installing hooks; observing those constructors
+        // recursively floods the log and changes startup timing.
+    }
+
+    private void inspectSemanticMethods(Class<?> loaded) {
+        try {
+            Set<String> names = new LinkedHashSet<>();
+            for (Method method : loaded.getDeclaredMethods()) names.add(method.getName());
+            int score = 0;
+            for (String candidate : new String[]{"getCryptogram", "registerListeners",
+                    "onInvalidCallback", "getThreatChannelData", "getThreatIdentifiers",
+                    "getRaspExecutionStateChannelData", "requestToken"}) {
+                if (names.contains(candidate)) score++;
+            }
+            if (score >= 2 || names.contains("getCryptogram") || names.contains("requestToken")) {
+                diagOnce("CLASS", "semantic-" + loaded.getName(), "semantic candidate="
+                    + loaded.getName() + " methods=" + clip(names.toString()));
+                hookStableBridgeMethods(loaded);
+            }
+        } catch (Throwable t) {
+            diagOnce("EX", "inspect-" + loaded.getName(), "method inspection failed class="
+                + loaded.getName() + " err=" + throwableShape(t));
+        }
+    }
+
+    private void installKnownDiagnostics(ClassLoader loader, String reason) {
+        if (loader == null) return;
+        diagOnce("CLASS", "known-pass-" + reason + "-" + loaderName(loader),
+            "known-class diagnostic pass reason=" + reason + " loader=" + loaderName(loader));
+        for (String name : new String[]{
+                PLUGIN,
+                TARGET_PACKAGE + ".integrity.PlayIntegrityModule",
+                "androidx.security.FNatives",
+                "com.pairip.VMRunner",
+                "com.google.android.play.core.integrity.IntegrityTokenRequest$Builder",
+                "com.google.android.play.core.integrity.IntegrityTokenResponse",
+                "com.google.android.play.core.integrity.StandardIntegrityTokenRequest$Builder",
+                "com.google.android.play.core.integrity.StandardIntegrityToken",
+                "com.google.android.gms.tasks.TaskCompletionSource",
+                "okhttp3.Request$Builder",
+                "okhttp3.Response$Builder"}) {
+            try {
+                Class<?> cls = XposedHelpers.findClass(name, loader);
+                diagOnce("CLASS", "known-found-" + name, "resolved=" + name
+                    + " reason=" + reason + " loader=" + loaderName(cls.getClassLoader()));
+                installLoadedClassDiagnostics(cls);
+            } catch (Throwable ignored) {
+                // Late discovery handles protected/split classes without startup noise.
+            }
+        }
+    }
+
+    private void installLoadedClassDiagnostics(Class<?> cls) {
+        String name = cls.getName();
+        String lower = name.toLowerCase();
+        if (name.equals(PLUGIN) || lower.contains("talsec") || lower.contains("appicrypt")) {
+            hookStableBridgeMethods(cls);
+        }
+        if (name.equals("androidx.security.FNatives")) hookNamedMethods(cls, "JNI", "x", "y", "z");
+        if (name.equals("com.pairip.VMRunner")) hookNamedMethods(cls, "PAIRIP", "invoke", "executeVM");
+        if (lower.contains("playintegrity") || lower.contains("play.core.integrity")
+                || lower.contains("standardintegrity") || lower.contains("integritytoken")) {
+            hookNamedMethods(cls, "INTEGRITY", "requestToken", "requestIntegrityToken",
+                "prepareIntegrityToken", "token", "setNonce", "setRequestHash",
+                "setCloudProjectNumber", "build");
+        }
+        if (name.equals("com.google.android.gms.tasks.TaskCompletionSource")) {
+            hookNamedMethods(cls, "TASK", "setResult", "trySetResult",
+                "setException", "trySetException");
+        }
+        if (name.equals("okhttp3.Request$Builder")) hookOkHttpRequestBuilder(cls);
+        if (name.equals("okhttp3.Response$Builder")) hookOkHttpResponseBuilder(cls);
+        if (lower.contains("promiseimpl") || lower.endsWith("promise")) hookPromiseClass(cls);
+    }
+
+    private void hookStableBridgeMethods(Class<?> cls) {
+        hookNamedMethods(cls, "RN", "registerListeners", "onInvalidCallback",
+            "getCryptogram", "getIdentifiers", "getThreatChannelData",
+            "getThreatIdentifiers", "getRaspExecutionStateChannelData",
+            "getRaspExecutionStateIdentifiers", "removeListenerForEvent");
+    }
+
+    private void hookNamedMethods(final Class<?> cls, final String category,
+                                  String... methods) {
+        for (final String method : methods) {
+            final String key = cls.getName() + "#" + method;
+            if (!claimDiagnosticHook(key)) continue;
+            try {
+                Set<?> hooks = XposedBridge.hookAllMethods(cls, method, new XC_MethodHook() {
+                    protected void beforeHookedMethod(MethodHookParam p) {
+                        rememberPromises(p.args, cls.getName() + "#" + method);
+                        diag(category, "enter " + cls.getName() + "#" + method
+                            + " args=" + argsShape(p.args) + " caller=" + callerFingerprint());
+                    }
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        if (p.getThrowable() != null) {
+                            diag(category, "throw " + cls.getName() + "#" + method
+                                + " err=" + throwableShape(p.getThrowable()));
+                        } else {
+                            diag(category, "return " + cls.getName() + "#" + method
+                                + " result=" + valueShape(p.getResult()));
+                        }
+                    }
+                });
+                if (hooks == null || hooks.isEmpty()) releaseDiagnosticHook(key);
+                else diagOnce("HOOK", key, "observing " + key + " overloads=" + hooks.size());
+            } catch (Throwable t) {
+                releaseDiagnosticHook(key);
+                diagOnce("EX", "hook-" + key, "hook failed " + key + " " + throwableShape(t));
+            }
+        }
+    }
+
+    private void rememberPromises(Object[] args, String operation) {
+        if (args == null) return;
+        for (Object arg : args) {
+            if (arg == null) continue;
+            String name = arg.getClass().getName().toLowerCase();
+            if (!name.contains("promise")) continue;
+            pendingPromises.put(arg, operation);
+            hookPromiseClass(arg.getClass());
+            diagOnce("RN", "promise-" + System.identityHashCode(arg),
+                "promise correlated operation=" + operation + " class=" + arg.getClass().getName());
+        }
+    }
+
+    private void hookPromiseClass(final Class<?> cls) {
+        for (final String method : new String[]{"resolve", "reject"}) {
+            final String key = cls.getName() + "#promise-" + method;
+            if (!claimDiagnosticHook(key)) continue;
+            try {
+                Set<?> hooks = XposedBridge.hookAllMethods(cls, method, new XC_MethodHook() {
+                    protected void beforeHookedMethod(MethodHookParam p) {
+                        String operation = pendingPromises.get(p.thisObject);
+                        if (operation == null) return;
+                        diag("RN", "promise " + method + " operation=" + operation
+                            + " args=" + argsShape(p.args));
+                    }
+                });
+                if (hooks == null || hooks.isEmpty()) releaseDiagnosticHook(key);
+            } catch (Throwable t) {
+                releaseDiagnosticHook(key);
+            }
+        }
+    }
+
+    private void hookPackageManagerDiagnostics(ClassLoader cl) {
+        try {
+            Class<?> pm = XposedHelpers.findClass("android.app.ApplicationPackageManager", cl);
+            for (final String method : new String[]{"getInstallerPackageName", "getInstallSourceInfo",
+                    "getPackageInfo", "getApplicationInfo", "getPackagesForUid"}) {
+                final String key = pm.getName() + "#diag-" + method;
+                if (!claimDiagnosticHook(key)) continue;
+                Set<?> hooks = XposedBridge.hookAllMethods(pm, method, new XC_MethodHook() {
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        String query = firstString(p.args);
+                        if (!isInterestingPackageQuery(query) && !"getPackagesForUid".equals(method)) return;
+                        String result = valueShape(p.getResult());
+                        if ("getInstallSourceInfo".equals(method) && p.getResult() != null) {
+                            try {
+                                Object info = p.getResult();
+                                result = "initiating=" + XposedHelpers.callMethod(info, "getInitiatingPackageName")
+                                    + " originating=" + XposedHelpers.callMethod(info, "getOriginatingPackageName")
+                                    + " installing=" + XposedHelpers.callMethod(info, "getInstallingPackageName");
+                            } catch (Throwable ignored) {}
+                        }
+                        String message = method + " query=" + safePackage(query)
+                            + " result=" + clip(result)
+                            + (p.getThrowable() == null ? "" : " err=" + throwableShape(p.getThrowable()));
+                        diagOnce("PM", method + '-' + safePackage(query) + '-' + clip(result), message);
+                    }
+                });
+                if (hooks == null || hooks.isEmpty()) releaseDiagnosticHook(key);
+            }
+        } catch (Throwable t) {
+            diagOnce("EX", "pm-diag", "package-manager diagnostics unavailable " + throwableShape(t));
+        }
+    }
+
+    private void hookSettingsDiagnostics(ClassLoader cl) {
+        for (String className : new String[]{"android.provider.Settings$Global",
+                "android.provider.Settings$Secure", "android.provider.Settings$System"}) {
+            try {
+                Class<?> settings = XposedHelpers.findClass(className, cl);
+                for (final String method : new String[]{"getString", "getInt", "getLong"}) {
+                    final String key = className + "#diag-" + method;
+                    if (!claimDiagnosticHook(key)) continue;
+                    Set<?> hooks = XposedBridge.hookAllMethods(settings, method, new XC_MethodHook() {
+                        protected void afterHookedMethod(MethodHookParam p) {
+                            String setting = firstString(p.args);
+                            if (!isInterestingSetting(setting)) return;
+                            diag("STATE", "setting " + setting + " -> " + valueShape(p.getResult())
+                                + " caller=" + callerFingerprint());
+                        }
+                    });
+                    if (hooks == null || hooks.isEmpty()) releaseDiagnosticHook(key);
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        try {
+            Class<?> properties = XposedHelpers.findClass("android.os.SystemProperties", null);
+            for (final String method : new String[]{"get", "getInt", "getLong", "getBoolean"}) {
+                final String key = properties.getName() + "#diag-" + method;
+                if (!claimDiagnosticHook(key)) continue;
+                Set<?> hooks = XposedBridge.hookAllMethods(properties, method, new XC_MethodHook() {
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        String property = firstString(p.args);
+                        if (!isInterestingProperty(property)) return;
+                        diag("STATE", "property " + property + " -> " + valueShape(p.getResult())
+                            + " caller=" + callerFingerprint());
+                    }
+                });
+                if (hooks == null || hooks.isEmpty()) releaseDiagnosticHook(key);
+            }
+        } catch (Throwable t) {
+            diagOnce("EX", "property-diag", "SystemProperties diagnostics unavailable "
+                + throwableShape(t));
+        }
+    }
+
+    private void hookRootAndDebugDiagnostics(ClassLoader cl) {
+        try {
+            Class<?> debug = XposedHelpers.findClass("android.os.Debug", null);
+            hookNamedMethods(debug, "STATE", "isDebuggerConnected", "waitingForDebugger");
+        } catch (Throwable ignored) {}
+
+        try {
+            final Class<?> file = XposedHelpers.findClass("java.io.File", null);
+            for (final String method : new String[]{"exists", "canExecute", "canRead"}) {
+                final String key = file.getName() + "#diag-" + method;
+                if (!claimDiagnosticHook(key)) continue;
+                Set<?> hooks = XposedBridge.hookAllMethods(file, method, new XC_MethodHook() {
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        String path;
+                        try { path = String.valueOf(XposedHelpers.callMethod(p.thisObject, "getAbsolutePath")); }
+                        catch (Throwable ignored) { return; }
+                        if (!isInterestingPath(path)) return;
+                        diag("STATE", "file." + method + " path=" + clip(path)
+                            + " -> " + valueShape(p.getResult()) + " caller=" + callerFingerprint());
+                    }
+                });
+                if (hooks == null || hooks.isEmpty()) releaseDiagnosticHook(key);
+            }
+        } catch (Throwable ignored) {}
+
+        try {
+            final String key = Runtime.class.getName() + "#diag-exec";
+            if (claimDiagnosticHook(key)) {
+                Set<?> hooks = XposedBridge.hookAllMethods(Runtime.class, "exec", new XC_MethodHook() {
+                    protected void beforeHookedMethod(MethodHookParam p) {
+                        String command = argsShape(p.args);
+                        if (containsProbeToken(command)) {
+                            diag("STATE", "Runtime.exec probe=" + clip(command)
+                                + " caller=" + callerFingerprint());
+                        }
+                    }
+                });
+                if (hooks == null || hooks.isEmpty()) releaseDiagnosticHook(key);
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private void hookOkHttpRequestBuilder(final Class<?> cls) {
+        final String key = cls.getName() + "#diag-build-request";
+        if (!claimDiagnosticHook(key)) return;
+        try {
+            Set<?> hooks = XposedBridge.hookAllMethods(cls, "build", new XC_MethodHook() {
+                protected void afterHookedMethod(MethodHookParam p) {
+                    if (p.getThrowable() != null || p.getResult() == null) return;
+                    Object request = p.getResult();
+                    try {
+                        String method = String.valueOf(XposedHelpers.callMethod(request, "method"));
+                        String url = String.valueOf(XposedHelpers.callMethod(request, "url"));
+                        if (isRelevantUrl(url)) {
+                            diag("NET", "request method=" + method + " url=" + sanitizeUrl(url));
+                        }
+                    } catch (Throwable t) {
+                        diagOnce("EX", "okhttp-request-shape", "OkHttp request probe "
+                            + throwableShape(t));
+                    }
+                }
+            });
+            if (hooks == null || hooks.isEmpty()) releaseDiagnosticHook(key);
+            else diagOnce("HOOK", key, "OkHttp request diagnostics installed");
+        } catch (Throwable t) {
+            releaseDiagnosticHook(key);
+        }
+    }
+
+    private void hookOkHttpResponseBuilder(final Class<?> cls) {
+        final String key = cls.getName() + "#diag-build-response";
+        if (!claimDiagnosticHook(key)) return;
+        try {
+            Set<?> hooks = XposedBridge.hookAllMethods(cls, "build", new XC_MethodHook() {
+                protected void afterHookedMethod(MethodHookParam p) {
+                    if (p.getThrowable() != null || p.getResult() == null) return;
+                    Object response = p.getResult();
+                    try {
+                        Object request = XposedHelpers.callMethod(response, "request");
+                        String url = String.valueOf(XposedHelpers.callMethod(request, "url"));
+                        if (!isRelevantUrl(url)) return;
+                        Object code = XposedHelpers.callMethod(response, "code");
+                        Object successful = XposedHelpers.callMethod(response, "isSuccessful");
+                        StringBuilder message = new StringBuilder("response code=")
+                            .append(code).append(" success=").append(successful)
+                            .append(" url=").append(sanitizeUrl(url));
+                        if (url.contains("/android/attest") || url.contains("/android/session")) {
+                            try {
+                                Object peek = XposedHelpers.callMethod(response, "peekBody", 8192L);
+                                String body = String.valueOf(XposedHelpers.callMethod(peek, "string"));
+                                message.append(" body=").append(sanitizeNetworkBody(body));
+                            } catch (Throwable bodyError) {
+                                message.append(" bodyShape=").append(throwableShape(bodyError));
+                            }
+                        }
+                        diag("NET", message.toString());
+                    } catch (Throwable t) {
+                        diagOnce("EX", "okhttp-response-shape", "OkHttp response probe "
+                            + throwableShape(t));
+                    }
+                }
+            });
+            if (hooks == null || hooks.isEmpty()) releaseDiagnosticHook(key);
+            else diagOnce("HOOK", key, "OkHttp response diagnostics installed");
+        } catch (Throwable t) {
+            releaseDiagnosticHook(key);
+        }
+    }
+
+    private void hookUiDiagnostics(ClassLoader cl) {
+        hookTextArgumentMethods("android.widget.TextView", null, "setText");
+        hookTextArgumentMethods("android.widget.Toast", null, "makeText", "setText");
+        hookTextArgumentMethods("android.app.AlertDialog$Builder", null, "setTitle", "setMessage");
+        hookTextArgumentMethods("android.app.Dialog", null, "setTitle");
+
+        try {
+            Class<?> resources = XposedHelpers.findClass("android.content.res.Resources", null);
+            for (final String method : new String[]{"getText", "getString"}) {
+                final String key = resources.getName() + "#diag-" + method;
+                if (!claimDiagnosticHook(key)) continue;
+                Set<?> hooks = XposedBridge.hookAllMethods(resources, method, new XC_MethodHook() {
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        Object result = p.getResult();
+                        if (result != null && isSecurityText(String.valueOf(result))) {
+                            diag("UI", "Resources." + method + " text="
+                                + clip(String.valueOf(result)) + " args=" + argsShape(p.args)
+                                + " caller=" + callerFingerprint());
+                        }
+                    }
+                });
+                if (hooks == null || hooks.isEmpty()) releaseDiagnosticHook(key);
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private void hookTextArgumentMethods(String className, ClassLoader cl, String... methods) {
+        try {
+            Class<?> cls = XposedHelpers.findClass(className, cl);
+            for (final String method : methods) {
+                final String key = className + "#diag-text-" + method;
+                if (!claimDiagnosticHook(key)) continue;
+                Set<?> hooks = XposedBridge.hookAllMethods(cls, method, new XC_MethodHook() {
+                    protected void beforeHookedMethod(MethodHookParam p) {
+                        if (p.args == null) return;
+                        for (Object arg : p.args) {
+                            if (!(arg instanceof CharSequence)) continue;
+                            String text = String.valueOf(arg);
+                            if (isSecurityText(text)) {
+                                diag("UI", cls.getName() + "#" + method + " text="
+                                    + clip(text) + " caller=" + callerFingerprint());
+                            }
+                        }
+                    }
+                });
+                if (hooks == null || hooks.isEmpty()) releaseDiagnosticHook(key);
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private void hookExitDiagnostics(ClassLoader cl) {
+        hookNamedMethods(System.class, "EXIT", "exit");
+        hookNamedMethods(Runtime.class, "EXIT", "exit", "halt");
+        try {
+            Class<?> process = XposedHelpers.findClass("android.os.Process", null);
+            hookNamedMethods(process, "EXIT", "killProcess", "killProcessQuiet",
+                "sendSignal", "sendSignalQuiet");
+        } catch (Throwable ignored) {}
+        try {
+            Class<?> os = XposedHelpers.findClass("android.system.Os", null);
+            hookNamedMethods(os, "EXIT", "kill");
+        } catch (Throwable ignored) {}
+    }
+
+    private void logDeviceSnapshot() {
+        try {
+            Class<?> build = XposedHelpers.findClass("android.os.Build", null);
+            Object fingerprint = XposedHelpers.getStaticObjectField(build, "FINGERPRINT");
+            Object tags = XposedHelpers.getStaticObjectField(build, "TAGS");
+            Object type = XposedHelpers.getStaticObjectField(build, "TYPE");
+            Object abis = XposedHelpers.getStaticObjectField(build, "SUPPORTED_ABIS");
+            diagOnce("STATE", "build-snapshot", "build type=" + type + " tags=" + tags
+                + " fingerprint=" + clip(String.valueOf(fingerprint))
+                + " abis=" + valueShape(abis));
+        } catch (Throwable t) {
+            diagOnce("EX", "build-snapshot", "Build snapshot failed " + throwableShape(t));
+        }
+        try {
+            Class<?> props = XposedHelpers.findClass("android.os.SystemProperties", null);
+            StringBuilder out = new StringBuilder();
+            for (String name : new String[]{"ro.debuggable", "ro.secure", "ro.build.type",
+                    "ro.build.tags", "ro.boot.verifiedbootstate", "ro.boot.flash.locked",
+                    "ro.kernel.qemu", "ro.hardware", "service.adb.root"}) {
+                Object value = XposedHelpers.callStaticMethod(props, "get", name, "");
+                if (out.length() > 0) out.append(' ');
+                out.append(name).append('=').append(value);
+            }
+            diagOnce("STATE", "property-snapshot", out.toString());
+        } catch (Throwable t) {
+            diagOnce("EX", "property-snapshot", "property snapshot failed " + throwableShape(t));
+        }
+    }
+
+    private static boolean claimDiagnosticHook(String key) {
+        synchronized (diagnosticLock) { return installedDiagnosticHooks.add(key); }
+    }
+
+    private static void releaseDiagnosticHook(String key) {
+        synchronized (diagnosticLock) { installedDiagnosticHooks.remove(key); }
+    }
+
+    private static void diagOnce(String category, String key, String message) {
+        synchronized (diagnosticLock) {
+            if (!diagnosticKeys.add(category + ':' + key)) return;
+        }
+        diag(category, message);
+    }
+
+    private static void diag(String category, String message) {
+        int sequence = diagnosticSequence.incrementAndGet();
+        if (sequence > MAX_DIAGNOSTIC_LINES) return;
+        try {
+            XposedBridge.log("[TK-DIAG][" + category + "][" + sequence + "]["
+                + (System.nanoTime() / 1_000_000L) + "ms] " + clip(message));
+        } catch (Throwable ignored) {}
+    }
+
+    private static String loaderName(ClassLoader loader) {
+        if (loader == null) return "bootstrap";
+        return loader.getClass().getName() + '@'
+            + Integer.toHexString(System.identityHashCode(loader));
+    }
+
+    private static boolean isFrameworkClass(String name) {
+        return name.startsWith("java.") || name.startsWith("javax.")
+            || name.startsWith("android.") || name.startsWith("com.android.")
+            || name.startsWith("dalvik.") || name.startsWith("libcore.")
+            || name.startsWith("sun.") || name.startsWith("kotlin.");
+    }
+
+    private static boolean isInterestingClassName(String name) {
+        String lower = name.toLowerCase();
+        return lower.contains("talsec") || lower.contains("rasp")
+            || lower.contains("integrity") || lower.contains("security")
+            || lower.contains("crypt") || lower.contains("pairip")
+            || lower.contains("promise") || lower.contains("okhttp")
+            || lower.contains("react") || name.equals("Nd.w") || name.equals("Nd.u")
+            || name.equals("androidx.security.FNatives");
+    }
+
+    private static String argsShape(Object[] args) {
+        if (args == null) return "null";
+        StringBuilder out = new StringBuilder("[");
+        for (int i = 0; i < args.length; i++) {
+            if (i > 0) out.append(',');
+            out.append(valueShape(args[i]));
+        }
+        return clip(out.append(']').toString());
+    }
+
+    private static String valueShape(Object value) {
+        if (value == null) return "null";
+        if (value instanceof String || value instanceof CharSequence) {
+            return value.getClass().getSimpleName() + "[len=" + String.valueOf(value).length() + ']';
+        }
+        if (value instanceof Number || value instanceof Boolean || value instanceof Character) {
+            return value.getClass().getSimpleName() + '[' + String.valueOf(value) + ']';
+        }
+        Class<?> cls = value.getClass();
+        if (cls.isArray()) {
+            try {
+                return cls.getComponentType().getTypeName() + "[len="
+                    + java.lang.reflect.Array.getLength(value) + ']';
+            } catch (Throwable ignored) {}
+        }
+        if (value instanceof Map<?, ?>) {
+            return cls.getName() + "[size=" + ((Map<?, ?>) value).size()
+                + " keys=" + clip(((Map<?, ?>) value).keySet().toString()) + ']';
+        }
+        if (value instanceof java.util.Collection<?>) {
+            return cls.getName() + "[size=" + ((java.util.Collection<?>) value).size() + ']';
+        }
+        return cls.getName();
+    }
+
+    private static String throwableShape(Throwable value) {
+        if (value == null) return "null";
+        String message = value.getMessage();
+        return value.getClass().getName() + (message == null ? "" : "[messageLen="
+            + message.length() + ']');
+    }
+
+    private static String callerFingerprint() {
+        try {
+            int kept = 0;
+            StringBuilder out = new StringBuilder();
+            for (StackTraceElement frame : Thread.currentThread().getStackTrace()) {
+                String name = frame.getClassName();
+                if (name.equals(Hook.class.getName()) || name.startsWith("java.lang.Thread")
+                        || name.contains("XposedBridge") || name.contains("XposedHelpers")
+                        || name.startsWith("de.robv.android.xposed")) continue;
+                if (out.length() > 0) out.append('>');
+                out.append(name).append('#').append(frame.getMethodName());
+                if (++kept >= 5) break;
+            }
+            return clip(out.toString());
+        } catch (Throwable ignored) { return "unknown"; }
+    }
+
+    private static String firstString(Object[] args) {
+        if (args == null) return null;
+        for (Object arg : args) if (arg instanceof String) return (String) arg;
+        return null;
+    }
+
+    private static boolean isInterestingPackageQuery(String value) {
+        if (value == null) return false;
+        String lower = value.toLowerCase();
+        return value.equals(TARGET_PACKAGE) || lower.contains("magisk")
+            || lower.contains("xposed") || lower.contains("lsposed")
+            || lower.contains("frida") || lower.contains("kernelsu")
+            || lower.contains("superuser") || lower.endsWith(".su")
+            || lower.contains("root");
+    }
+
+    private static String safePackage(String value) {
+        if (value == null) return "null";
+        return clip(value);
+    }
+
+    private static boolean isInterestingSetting(String value) {
+        if (value == null) return false;
+        return value.equals("adb_enabled") || value.equals("development_settings_enabled")
+            || value.equals("mock_location") || value.equals("install_non_market_apps")
+            || value.equals("verifier_verify_adb_installs") || value.equals("http_proxy");
+    }
+
+    private static boolean isInterestingProperty(String value) {
+        if (value == null) return false;
+        return value.equals("ro.debuggable") || value.equals("ro.secure")
+            || value.equals("ro.build.type") || value.equals("ro.build.tags")
+            || value.equals("ro.build.fingerprint") || value.equals("ro.boot.verifiedbootstate")
+            || value.equals("ro.boot.flash.locked") || value.equals("ro.kernel.qemu")
+            || value.equals("ro.hardware") || value.equals("service.adb.root");
+    }
+
+    private static boolean isInterestingPath(String value) {
+        if (value == null) return false;
+        String lower = value.toLowerCase();
+        return lower.equals("/system/bin/su") || lower.equals("/system/xbin/su")
+            || lower.equals("/sbin/su") || lower.startsWith("/sbin/.magisk")
+            || lower.startsWith("/data/adb") || lower.contains("magisk")
+            || lower.contains("xposed") || lower.contains("lsposed")
+            || lower.contains("frida") || lower.contains("zygisk")
+            || lower.contains("kernelsu");
+    }
+
+    private static boolean containsProbeToken(String value) {
+        if (value == null) return false;
+        String lower = value.toLowerCase();
+        return lower.contains(" su") || lower.contains("which") || lower.contains("getprop")
+            || lower.contains("magisk") || lower.contains("xposed")
+            || lower.contains("frida") || lower.contains("mount")
+            || lower.contains("busybox") || lower.contains("id");
+    }
+
+    private static boolean isRelevantUrl(String value) {
+        if (value == null) return false;
+        String lower = value.toLowerCase();
+        return lower.contains("diskwala") || lower.contains("/android/session")
+            || lower.contains("/android/attest") || lower.contains("integrity");
+    }
+
+    private static String sanitizeUrl(String value) {
+        if (value == null) return "null";
+        int query = value.indexOf('?');
+        return clip(query < 0 ? value : value.substring(0, query) + "?<redacted>");
+    }
+
+    private static String sanitizeNetworkBody(String value) {
+        if (value == null) return "null";
+        String redacted = value.replaceAll(
+            "(?i)(\\\"(?:tk|it|c|token|nonce|challenge|crypt|cryptogram|sid|did)\\\"\\s*:\\s*\\\")[^\\\"]*(\\\")",
+            "$1<redacted>$2");
+        redacted = redacted.replaceAll("[A-Za-z0-9_\\-./+=]{80,}", "<redacted-long-value>");
+        return clip(redacted);
+    }
+
+    private static boolean isSecurityText(String value) {
+        if (value == null) return false;
+        String lower = value.toLowerCase();
+        return lower.contains("modded") || lower.contains("modified")
+            || lower.contains("official store") || lower.contains("rooted")
+            || lower.contains("jailbreak") || lower.contains("hook")
+            || lower.contains("security alert") || lower.contains("insecure")
+            || lower.contains("developer mode") || lower.contains("isn't supported")
+            || lower.contains("not supported") || lower.contains("simulator")
+            || lower.contains("cloned") || lower.contains("automation")
+            || lower.contains("prove it hasn't been modified");
+    }
+
+    private static String clip(String value) {
+        if (value == null) return "null";
+        String singleLine = value.replace('\n', ' ').replace('\r', ' ');
+        return singleLine.length() <= MAX_DIAGNOSTIC_TEXT ? singleLine
+            : singleLine.substring(0, MAX_DIAGNOSTIC_TEXT) + "…";
     }
 
     // ── process-kill guard ───────────────────────────────────────────────────
