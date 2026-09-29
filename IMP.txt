@@ -1,1 +1,3 @@
 Reminder on the two standing operating rules while two rooted instances run: keep the KernelSU su allowlist empty, and manage modules per-instance via the ksud CLI rather than the Manager GUI.
+
+grant root access via : docker exec container_name (uid 0)

@@ -9,14 +9,13 @@ import java.io.FileInputStream;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Exact-APK gate probe. Observe by default. Local mode only renders the normal
+ * Package-scoped DiskWala gate probe. Observe by default. Local mode only renders the normal
  * signed-out UI, without changing the launch state. Mock mode additionally
  * requires an enabled fixture file; its client-only responses are not server
  * attestations, credentials, or evidence that authentication succeeded.
@@ -34,6 +33,7 @@ public final class Hook implements IXposedHookLoadPackage {
     private ResponseBodies captures;
     private VaultKeys keys;
     private MockResponses mocks;
+    private SignerBridge signerBridge;
     private String lastLaunchState;
     private GateMode mode = GateMode.OBSERVE;
 
@@ -42,40 +42,111 @@ public final class Hook implements IXposedHookLoadPackage {
         if (!GatePolicy.PACKAGE.equals(lp.packageName)
                 || !GatePolicy.PACKAGE.equals(lp.processName)) return;
         mode = readMode();
-        log("mode=" + mode + " target=" + GatePolicy.TARGET_VERSION + "/"
-            + GatePolicy.TARGET_VERSION_CODE);
+        log("mode=" + mode + " targetPackage=" + GatePolicy.PACKAGE + " packageOnly=true");
         if (mode == GateMode.OFF) return;
         try {
-            if (lp.appInfo == null || !GatePolicy.BASE_SHA256.equals(sha256(lp.appInfo.sourceDir))) {
-                log("SKIP: APK digest does not match tested " + GatePolicy.TARGET_VERSION
-                    + "; no hooks installed");
-                return;
-            }
-            captures = new ResponseBodies(lp.appInfo.dataDir);
-            keys = new VaultKeys(lp.appInfo.dataDir);
-            if (mode == GateMode.MOCK) {
+            if (lp.appInfo == null) throw new IllegalStateException("missing ApplicationInfo");
+            installPairIpVmGate(lp.classLoader);
+            if (GatePolicy.signerEnabled(mode)) {
                 try {
-                    mocks = MockResponses.load();
-                    log("MOCK_FIXTURES count=" + mocks.size()
-                        + " (client-only; real responses still captured)");
-                } catch (Exception invalidConfig) {
-                    log("MOCK_DISABLED invalid config class=" + type(invalidConfig));
+                    signerBridge = SignerBridge.start(lp.appInfo.dataDir, this::log);
+                    log("SIGNER bridge enabled loopbackOnly=true port=" + SignerBridge.PORT);
+                } catch (Throwable signerError) {
+                    log("SIGNER disabled class=" + type(signerError));
                 }
             }
-            install(lp.classLoader);
-            log("ACTIVE hooks=" + installed.size() + " digest=verified"
-                + " tokens=untouched bodyCapture=redacted");
+            if (GatePolicy.legacyDiagnosticsEnabled(mode)) {
+                captures = new ResponseBodies(lp.appInfo.dataDir);
+                keys = new VaultKeys(lp.appInfo.dataDir);
+                if (mode == GateMode.MOCK) {
+                    try {
+                        mocks = MockResponses.load();
+                        log("MOCK_FIXTURES count=" + mocks.size()
+                            + " (client-only; real responses still captured)");
+                    } catch (Exception invalidConfig) {
+                        log("MOCK_DISABLED invalid config class=" + type(invalidConfig));
+                    }
+                }
+                try {
+                    installDiagnostics(lp.classLoader);
+                } catch (Throwable changedBuild) {
+                    // Optional legacy diagnostics use release-specific obfuscated names.
+                    log("DIAGNOSTICS skipped for changed app build class=" + type(changedBuild));
+                }
+            } else {
+                log("OBSERVE named PairIP metadata only; legacy body/key capture disabled");
+            }
+            log("ACTIVE hooks=" + installed.size()
+                + " package-scoped tokens=untouched legacyDiagnostics="
+                + GatePolicy.legacyDiagnosticsEnabled(mode));
         } catch (Throwable error) {
             // Fail open as a group; don't leave a partial experiment installed.
             for (XC_MethodHook.Unhook hook : installed) {
                 try { hook.unhook(); } catch (Throwable ignored) {}
             }
             installed.clear();
-            log("SKIP: signature mismatch or install failure class=" + type(error));
+            if (signerBridge != null) {
+                try { signerBridge.close(); } catch (Throwable ignored) {}
+                signerBridge = null;
+            }
+            log("SKIP: PairIP VM gate install failure class=" + type(error));
         }
     }
 
-    private void install(ClassLoader loader) throws Exception {
+    /**
+     * PairIP 26.4 replaces the requested Application/Activity with key-import
+     * placeholders when the per-version VM key is absent. Play Store then returns
+     * a PLAY_STORE_INTENT for LAUNCH_TRANSFER_NOT_TRUSTED_DIALOG. These hooks are
+     * deliberately limited to com.diskwalaapp's process by handleLoadPackage().
+     */
+    private void installPairIpVmGate(ClassLoader loader) throws Exception {
+        Class<?> client = resolve("com.pairip.vmencryption.KeyImportActiveClient", loader);
+        Class<?> requestType = resolve(
+            "com.pairip.vmencryption.KeyImportActiveClient$KeyImportRequestType", loader);
+        Class<?> connection = resolve(
+            "com.pairip.vmencryption.KeyImportActiveClient$KeyImportPlayStoreServiceConnection", loader);
+        Class<?> keyStore = resolve("com.pairip.vmencryption.KeyStoreManager", loader);
+
+        installed.add(XposedBridge.hookMethod(
+            client.getDeclaredConstructor(keyStore, String.class, int.class),
+            new SafeHook() {
+                @Override void before(MethodHookParam p) {
+                    if (GatePolicy.PACKAGE.equals(p.args[1])) {
+                        log("PAIRIP_VM request version=" + p.args[2] + " unchanged=true");
+                    }
+                }
+            }));
+        hook(client.getDeclaredMethod("resolveRequestType", android.content.Context.class),
+            new SafeHook() {
+                @Override void after(MethodHookParam p) {
+                    Object result = p.getResult();
+                    if (requestType.isInstance(result)) {
+                        log("PAIRIP_VM requestType=" + ((Enum<?>) result).name()
+                            + " unchanged=true");
+                    }
+                }
+            });
+        hook(connection.getDeclaredMethod("processResponse", android.os.Bundle.class),
+            new SafeHook() {
+                @Override void before(MethodHookParam p) {
+                    android.os.Bundle response = (android.os.Bundle) p.args[0];
+                    log("PAIRIP_VM transfer response wrapped="
+                        + (response.getByteArray("WRAPPED_KEY") != null)
+                        + " unwrapped=" + (response.getByteArray("UNWRAPPED_KEY") != null)
+                        + " actionRequired=" + (response.getParcelable("PLAY_STORE_INTENT") != null));
+                }
+            });
+        hook(keyStore.getDeclaredMethod("saveUnwrappedEncryptionKey", int.class, byte[].class),
+            new SafeHook() {
+                @Override void after(MethodHookParam p) {
+                    log("PAIRIP_VM unwrapped key import aliasVersion=" + p.args[0]
+                        + " success=" + !p.hasThrowable());
+                }
+            });
+        log("PAIRIP_VM read-only request+response+import observations installed");
+    }
+
+    private void installDiagnostics(ClassLoader loader) throws Exception {
         Class<?> apiWorker = resolve("E5.b", loader);
         Class<?> apiResponse = resolve("E5.g", loader);
         Class<?> apiError = resolve("E5.f", loader);
@@ -415,16 +486,4 @@ public final class Hook implements IXposedHookLoadPackage {
         return result.toString();
     }
 
-    private static String sha256(String path) throws Exception {
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        try (FileInputStream in = new FileInputStream(path)) {
-            byte[] bytes = new byte[65536];
-            int length;
-            while ((length = in.read(bytes)) >= 0) if (length > 0) digest.update(bytes, 0, length);
-        }
-        char[] hex = "0123456789abcdef".toCharArray();
-        StringBuilder result = new StringBuilder(64);
-        for (byte b : digest.digest()) result.append(hex[(b & 0xff) >>> 4]).append(hex[b & 15]);
-        return result.toString();
-    }
 }

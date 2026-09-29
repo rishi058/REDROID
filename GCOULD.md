@@ -35,6 +35,16 @@ ssh -i "C:\Users\Rishi\.ssh\redroid-vm-20260919" -N `
   -L 5557:127.0.0.1:5557 `
   Rishi@35.254.242.42
 
-adb connect 127.0.0.1:5555
+adb connect 127.0.0.1:5557
 
 scrcpy -s 127.0.0.1:5557 --max-size=720 --max-fps=24 --video-bit-rate=2M --video-codec=h264 --no-audio
+
+---
+
+ssh -i "C:\Users\Rishi\.ssh\redroid-vm-20260919" -N `
+  -L 5559:127.0.0.1:5559 `
+  Rishi@35.254.242.42
+
+adb connect 127.0.0.1:5559
+
+scrcpy -s 127.0.0.1:5559 --max-size=720 --max-fps=24 --video-bit-rate=2M --video-codec=h264 --no-audio

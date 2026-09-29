@@ -18,7 +18,8 @@ public final class GateModeTest {
         expect(GateMode.LOCAL, " LOCAL\n");
         expect(GateMode.OFF, "off");
         expect(GateMode.MOCK, "mock");
+        expect(GateMode.SIGNER, "signer");
         expect(GateMode.OBSERVE, " ".repeat(65) + "local");
-        System.out.println("GateModeTest: 10 cases passed");
+        System.out.println("GateModeTest: 11 cases passed");
     }
 }

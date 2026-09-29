@@ -7,10 +7,6 @@ import java.util.Set;
 /** Log allowlists: arbitrary server strings, tokens, and identifiers are excluded. */
 final class GatePolicy {
     static final String PACKAGE = "com.diskwalaapp";
-    static final String TARGET_VERSION = "26.2";
-    static final int TARGET_VERSION_CODE = 353;
-    static final String BASE_SHA256 =
-        "c2babb8419c69e1f8334425764f1dafd1eac9a687ea30e1c53fd98086b9ce735";
     private static final Set<String> CODES = new HashSet<>(Arrays.asList(
         "device_not_trusted", "attestation_failed", "attest_key_unknown",
         "refresh_invalid", "refresh_device_mismatch", "device_belongs_to_another_account",
@@ -39,6 +35,16 @@ final class GatePolicy {
         // No Google, challenge issuance, login, refresh, or credential endpoints.
         return mode == GateMode.MOCK && ("attest/verify".equals(endpoint)
             || "appuser/version".equals(endpoint));
+    }
+
+    static boolean legacyDiagnosticsEnabled(GateMode mode) {
+        // These older obfuscated hooks include a sensitive content-key oracle.
+        // Package-scoped OBSERVE must not enable them on arbitrary updated APKs.
+        return mode == GateMode.LOCAL || mode == GateMode.MOCK;
+    }
+
+    static boolean signerEnabled(GateMode mode) {
+        return mode == GateMode.SIGNER;
     }
 
     private GatePolicy() {}

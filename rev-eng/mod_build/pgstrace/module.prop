@@ -1,0 +1,7 @@
+id=pgs_transfer_trace
+name=PGS Transfer Trace (system overlay)
+version=0.1
+versionCode=1
+author=local
+description=Play Store metadata-only transfer trace scaffold
+systemOverlayPath=system/app/PGSTrace/base.apk

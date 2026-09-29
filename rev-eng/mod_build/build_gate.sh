@@ -28,12 +28,15 @@ javac --release 11 -d "$BUILD/tests" \
     "$ROOT/gate/src/com/recon/dw26gate/GateMode.java" \
     "$ROOT/gate/src/com/recon/dw26gate/GatePolicy.java" \
     "$ROOT/gate/src/com/recon/dw26gate/GatePrivacy.java" \
+    "$ROOT/gate/src/com/recon/dw26gate/SignerPolicy.java" \
     "$ROOT/gate/tests/com/recon/dw26gate/GateModeTest.java" \
     "$ROOT/gate/tests/com/recon/dw26gate/GatePolicyTest.java" \
-    "$ROOT/gate/tests/com/recon/dw26gate/GatePrivacyTest.java"
+    "$ROOT/gate/tests/com/recon/dw26gate/GatePrivacyTest.java" \
+    "$ROOT/gate/tests/com/recon/dw26gate/SignerPolicyTest.java"
 java -cp "$BUILD/tests" com.recon.dw26gate.GateModeTest
 java -cp "$BUILD/tests" com.recon.dw26gate.GatePolicyTest
 java -cp "$BUILD/tests" com.recon.dw26gate.GatePrivacyTest
+java -cp "$BUILD/tests" com.recon.dw26gate.SignerPolicyTest
 
 echo '[1/6] Compile scoped module'
 javac --release 11 -cp "$CLASSPATH" -d "$BUILD/classes" \

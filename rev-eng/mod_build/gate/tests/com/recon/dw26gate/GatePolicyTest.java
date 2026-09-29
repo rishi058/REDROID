@@ -7,10 +7,6 @@ public final class GatePolicyTest {
 
     public static void main(String[] args) {
         check("com.diskwalaapp".equals(GatePolicy.PACKAGE));
-        check("26.2".equals(GatePolicy.TARGET_VERSION));
-        check(GatePolicy.TARGET_VERSION_CODE == 353);
-        check("c2babb8419c69e1f8334425764f1dafd1eac9a687ea30e1c53fd98086b9ce735"
-            .equals(GatePolicy.BASE_SHA256));
         check("device_not_trusted".equals(GatePolicy.code("device_not_trusted")));
         check("<redacted>".equals(GatePolicy.code("token-or-personal-data")));
         check("<redacted>".equals(GatePolicy.code(200)));
@@ -27,6 +23,13 @@ public final class GatePolicyTest {
         check(!GatePolicy.mockAllowed(GateMode.MOCK, "https://api.diskwala.com/attest/verify"));
         check(GatePolicy.mockAllowed(GateMode.MOCK, "attest/verify"));
         check(GatePolicy.mockAllowed(GateMode.MOCK, "appuser/version"));
-        System.out.println("GatePolicyTest: 20 cases passed");
+        check(!GatePolicy.legacyDiagnosticsEnabled(GateMode.OBSERVE));
+        check(!GatePolicy.legacyDiagnosticsEnabled(GateMode.OFF));
+        check(GatePolicy.legacyDiagnosticsEnabled(GateMode.LOCAL));
+        check(GatePolicy.legacyDiagnosticsEnabled(GateMode.MOCK));
+        check(!GatePolicy.legacyDiagnosticsEnabled(GateMode.SIGNER));
+        check(GatePolicy.signerEnabled(GateMode.SIGNER));
+        check(!GatePolicy.signerEnabled(GateMode.OBSERVE));
+        System.out.println("GatePolicyTest: 24 cases passed");
     }
 }

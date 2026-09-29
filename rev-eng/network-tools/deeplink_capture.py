@@ -24,6 +24,7 @@ them only in an ignored/private capture directory.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -218,6 +219,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--port", type=int, default=8080, help="local mitmdump port (default: 8080)")
     parser.add_argument(
+        "--allow-hosts",
+        help=(
+            "mitmproxy host regex to intercept; unmatched hosts are tunneled without "
+            "TLS interception"
+        ),
+    )
+    parser.add_argument(
+        "--upstream",
+        help="chain mitmdump to an upstream HTTP proxy, e.g. http://host:port",
+    )
+    parser.add_argument(
+        "--upstream-auth", help="user:pass credentials for the --upstream proxy",
+    )
+    parser.add_argument(
         "--serial", help="ADB serial; omitted only when exactly one usable device is connected",
     )
     parser.add_argument("--adb", default="adb", help="ADB executable (default: adb on PATH)")
@@ -370,6 +385,25 @@ def wait_for_duration(mitm: subprocess.Popen[bytes], duration: float) -> None:
         time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 
 
+def iso_time(timestamp: float | None) -> str | None:
+    if timestamp is None:
+        return None
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def connection_details(connection: Any) -> dict[str, Any]:
+    """Return JSON-safe transport and TLS metadata for a mitmproxy connection."""
+    peer = getattr(connection, "peername", None)
+    sock = getattr(connection, "sockname", None)
+    return {
+        "peername": list(peer) if peer else None,
+        "sockname": list(sock) if sock else None,
+        "sni": getattr(connection, "sni", None),
+        "tls_version": getattr(connection, "tls_version", None),
+        "cipher": str(getattr(connection, "cipher", "")) or None,
+    }
+
+
 def serialise(flow: Any) -> dict[str, Any]:
     request, response_message = flow.request, flow.response
     return {
@@ -384,6 +418,30 @@ def serialise(flow: Any) -> dict[str, Any]:
         "resp_body_bytes": len(message_bytes(response_message)),
         "request_started": getattr(request, "timestamp_start", None),
         "response_ended": getattr(response_message, "timestamp_end", None),
+        "id": str(flow.id),
+        "captured_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "request": {
+            "scheme": request.scheme,
+            "host": request.host,
+            "port": request.port,
+            "path": request.path,
+            "http_version": request.http_version,
+            "started_at": iso_time(getattr(request, "timestamp_start", None)),
+            "ended_at": iso_time(getattr(request, "timestamp_end", None)),
+        },
+        "response": (
+            {
+                "reason": getattr(response_message, "reason", None),
+                "http_version": getattr(response_message, "http_version", None),
+                "started_at": iso_time(getattr(response_message, "timestamp_start", None)),
+                "ended_at": iso_time(getattr(response_message, "timestamp_end", None)),
+            }
+            if response_message
+            else None
+        ),
+        "client": connection_details(flow.client_conn),
+        "server": connection_details(flow.server_conn),
+        "error": str(flow.error) if flow.error else None,
     }
 
 
@@ -507,6 +565,12 @@ def main() -> int:
             "-w", str(cap_path),
             "-s", str(Path(__file__).resolve()),
         ]
+        if args.allow_hosts:
+            command.extend(["--allow-hosts", args.allow_hosts])
+        if args.upstream:
+            command.extend(["--mode", f"upstream:{args.upstream}"])
+        if args.upstream_auth:
+            command.extend(["--upstream-auth", args.upstream_auth])
         print(f"[*] starting mitmdump on :{args.port} -> {cap_path}")
         mitm = subprocess.Popen(
             command,

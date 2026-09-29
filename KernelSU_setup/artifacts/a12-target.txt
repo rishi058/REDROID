@@ -1,0 +1,4 @@
+gr.nikolasspyr.integritycheck
+com.android.vending
+com.google.android.gms!
+com.diskwalaapp!

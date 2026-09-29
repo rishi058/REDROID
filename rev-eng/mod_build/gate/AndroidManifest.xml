@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.recon.dw26gate"
-    android:versionCode="6" android:versionName="0.6">
+    android:versionCode="11" android:versionName="0.11">
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
-    <application android:label="DiskWala 26.2 Gate Probe"
+    <application android:label="DiskWala Gate"
         android:hasCode="true" android:allowBackup="false">
         <meta-data android:name="xposedmodule" android:value="true" />
         <meta-data android:name="xposeddescription"
-            android:value="Version-pinned local sign-in gate test; no changes to Google tokens or keystore" />
+            android:value="Package-scoped DiskWala diagnostics with an explicit, loopback-only signer mode" />
         <meta-data android:name="xposedminversion" android:value="82" />
         <meta-data android:name="xposedscope" android:value="com.diskwalaapp" />
     </application>

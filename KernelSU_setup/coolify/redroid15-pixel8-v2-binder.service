@@ -1,0 +1,12 @@
+[Unit]
+Description=Prepare dedicated binderfs for redroid15-pixel8-v2
+After=local-fs.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/prepare-redroid15-pixel8-v2-binder
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

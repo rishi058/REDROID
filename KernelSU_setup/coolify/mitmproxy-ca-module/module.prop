@@ -1,0 +1,6 @@
+id=mitmproxy_ca
+name=Mitmproxy system CA
+version=1.0.0
+versionCode=1
+author=local
+description=Mounts the project mitmproxy CA into the Conscrypt APEX before Zygote.

@@ -4,6 +4,7 @@
 # USE THIS SCRIPT FOR EXECUTING COMMANDS
 #
 # Usage:
+#   Generally used for ssh cmd
 #   python access.py [--quiet] <command> [args...]
 #
 # --quiet / -q : suppress the banner and Exit Code lines so output can be
