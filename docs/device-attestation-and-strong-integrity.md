@@ -2,7 +2,7 @@
 
 > Companion to [PairIP-VM-encryption-key-import-gate.md](PairIP-VM-encryption-key-import-gate.md).
 > Question set: how does Google's trust server attest a device; why does the Play Store say *"This app is not supported for your device"* for DiskWala; is it the Strong Integrity failure; and can we simulate a physical device to pass Strong Integrity too.
-> Date: **2026-09-26**. Target device: `redroid-1` on the GCloud VM (`redroid-vm-20260919`, `35.254.242.42`, ADB via `-L 5555`).
+> Date: **2026-09-26**. Target device: `redroid-1` on the GCloud VM (`redroid-vm-20260919`, `35.188.214.74`, ADB via `-L 5555`).
 > Every "measured" fact below is separated from interpretation. Live device values were read read-only over ADB on 2026-09-26.
 
 ---
@@ -103,7 +103,7 @@ This banner is **not** the Play Integrity API verdict. It is the Play Store's **
 
 ## 3. Measured reality on redroid-1 (live snapshot, 2026-09-26)
 
-Read read-only over ADB (`-L 5555` tunnel to `35.254.242.42`). Root (`su`) is intentionally **not** authorized for the shell UID (KernelSU allowlist kept empty by policy), so TrickyStore's on-disk config could not be re-read live; those values are cited from repo memory instead.
+Read read-only over ADB (`-L 5555` tunnel to `35.188.214.74`). Root (`su`) is intentionally **not** authorized for the shell UID (KernelSU allowlist kept empty by policy), so TrickyStore's on-disk config could not be re-read live; those values are cited from repo memory instead.
 
 | Property | Value (measured) | Relevance |
 |---|---|---|
@@ -343,7 +343,7 @@ Ordered from cheapest to most involved. None of these is promised to fix DiskWal
 - [fixes.md](fixes.md) — BASIC-vs-DEVICE independence, the TrickyStore config fix that produced DEVICE pass
 - [new-finding.md](new-finding.md) — TEE Simulator regression analysis; DEVICE-is-the-ceiling findings
 - [integrity-debug/](integrity-debug/) — the integrity A/B harness (env snapshots, decode-once, verdict capture)
-- [GCOULD.md](GCOULD.md) — GCloud VM access (`redroid-vm-20260919`, `35.254.242.42`)
+- [GCOULD.md](GCOULD.md) — GCloud VM access (`redroid-vm-20260919`, `35.188.214.74`)
 
 ### 9.4 Live device snapshot (measured 2026-09-26, read-only)
 - `redroid-1` @ GCloud VM: redfin/Pixel 5, Android 14/SDK 34, security patch **`2024-05-05`**, `ro.hardware=redroid`, verified-boot **green**, `flash.locked=1`, `hardware_keystore=41`, GMS `26.34.36`.

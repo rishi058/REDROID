@@ -10,7 +10,7 @@
 
 | Item | Value |
 |---|---|
-| Host | GCloud VM `redroid-vm-20260919`, `35.254.242.42`, user `Rishi` |
+| Host | GCloud VM `redroid-vm-20260919`, `35.188.214.74`, user `Rishi` |
 | Host arch | `aarch64` (ARM64), **no GPU** (`/dev/dri` absent) |
 | Host kernel | `6.8.12-zksu-multi` (KernelSU‑patched, multi‑instance) |
 | Docker | rootful, `sudo docker` |
@@ -19,9 +19,9 @@
 
 SSH:
 ```powershell
-ssh -i "C:\Users\Rishi\.ssh\redroid-vm-20260919" Rishi@35.254.242.42
+ssh -i "C:\Users\Rishi\.ssh\redroid-vm-20260919" Rishi@35.188.214.74
 # ADB tunnel from Windows:
-ssh -i "C:\Users\Rishi\.ssh\redroid-vm-20260919" -N -L 5557:127.0.0.1:5557 Rishi@35.254.242.42
+ssh -i "C:\Users\Rishi\.ssh\redroid-vm-20260919" -N -L 5557:127.0.0.1:5557 Rishi@35.188.214.74
 adb connect 127.0.0.1:5557
 ```
 
