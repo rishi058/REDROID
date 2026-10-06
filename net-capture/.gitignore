@@ -1,0 +1,3 @@
+# Raw/large capture artifacts — keep the parsed JSON, not these.
+out/*.pcap
+out/*.mitmlog

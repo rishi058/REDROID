@@ -1,0 +1,333 @@
+{
+  "app": "VPN Gate",
+  "package": "com.giamping.sevpn",
+  "captured_at": "2026-10-04T10:49:53+00:00",
+  "duration_seconds": 30.0,
+  "summary": {
+    "unique_hostnames": 22,
+    "dns_queries": 0,
+    "tls_sni_hosts": 22,
+    "http_requests": 0,
+    "ip_endpoints": 27
+  },
+  "hostnames": [
+    "ae.iads.unity3d.com",
+    "cdn.iads.unity3d.com",
+    "csi.gstatic.com",
+    "dns.google",
+    "fonts.gstatic.com",
+    "fundingchoicesmessages.google.com",
+    "giamping.com",
+    "gist.github.com",
+    "gist.githubusercontent.com",
+    "googleads.g.doubleclick.net",
+    "i-adq.mediation.unity3d.com",
+    "i-sdk.mediation.unity3d.com",
+    "lh3.googleusercontent.com",
+    "logs.ads.vungle.com",
+    "manifest.googlevideo.com",
+    "o-sdk.mediation.unity3d.com",
+    "pagead2.googleadservices.com",
+    "pagead2.googlesyndication.com",
+    "rr1---sn-2o2imf-5j.googlevideo.com",
+    "rr4---sn-aj2im9-5q.googlevideo.com",
+    "tpc.googlesyndication.com",
+    "www.gstatic.com"
+  ],
+  "dns_queries": [],
+  "tls_sni": [
+    "ae.iads.unity3d.com",
+    "cdn.iads.unity3d.com",
+    "csi.gstatic.com",
+    "dns.google",
+    "fonts.gstatic.com",
+    "fundingchoicesmessages.google.com",
+    "giamping.com",
+    "gist.github.com",
+    "gist.githubusercontent.com",
+    "googleads.g.doubleclick.net",
+    "i-adq.mediation.unity3d.com",
+    "i-sdk.mediation.unity3d.com",
+    "lh3.googleusercontent.com",
+    "logs.ads.vungle.com",
+    "manifest.googlevideo.com",
+    "o-sdk.mediation.unity3d.com",
+    "pagead2.googleadservices.com",
+    "pagead2.googlesyndication.com",
+    "rr1---sn-2o2imf-5j.googlevideo.com",
+    "rr4---sn-aj2im9-5q.googlevideo.com",
+    "tpc.googlesyndication.com",
+    "www.gstatic.com"
+  ],
+  "http_requests": [],
+  "endpoints": [
+    {
+      "ip": "8.8.8.8",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 6,
+      "hostnames": [
+        "dns.google"
+      ],
+      "first_seen": "2026-10-04T10:49:54.534550+00:00"
+    },
+    {
+      "ip": "172.182.252.133",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 1,
+      "hostnames": [
+        "gist.github.com"
+      ],
+      "first_seen": "2026-10-04T10:49:55.080940+00:00"
+    },
+    {
+      "ip": "172.67.133.28",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 1,
+      "hostnames": [
+        "giamping.com"
+      ],
+      "first_seen": "2026-10-04T10:49:55.128595+00:00"
+    },
+    {
+      "ip": "185.199.110.133",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 1,
+      "hostnames": [
+        "gist.githubusercontent.com"
+      ],
+      "first_seen": "2026-10-04T10:49:55.265978+00:00"
+    },
+    {
+      "ip": "172.217.75.113",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 1,
+      "hostnames": [
+        "fundingchoicesmessages.google.com"
+      ],
+      "first_seen": "2026-10-04T10:49:57.401462+00:00"
+    },
+    {
+      "ip": "8.8.8.8",
+      "port": 443,
+      "protocol": "UDP",
+      "count": 147,
+      "hostnames": [
+        "dns.google"
+      ],
+      "first_seen": "2026-10-04T10:49:58.966972+00:00"
+    },
+    {
+      "ip": "192.178.164.155",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 9,
+      "hostnames": [
+        "googleads.g.doubleclick.net"
+      ],
+      "first_seen": "2026-10-04T10:49:58.993187+00:00"
+    },
+    {
+      "ip": "18.155.173.16",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 1,
+      "hostnames": [
+        "i-sdk.mediation.unity3d.com"
+      ],
+      "first_seen": "2026-10-04T10:49:59.199453+00:00"
+    },
+    {
+      "ip": "65.8.20.45",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 2,
+      "hostnames": [
+        "o-sdk.mediation.unity3d.com"
+      ],
+      "first_seen": "2026-10-04T10:49:59.617082+00:00"
+    },
+    {
+      "ip": "65.8.20.16",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 1,
+      "hostnames": [
+        "o-sdk.mediation.unity3d.com"
+      ],
+      "first_seen": "2026-10-04T10:49:59.648085+00:00"
+    },
+    {
+      "ip": "65.8.199.78",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 3,
+      "hostnames": [
+        "cdn.iads.unity3d.com"
+      ],
+      "first_seen": "2026-10-04T10:49:59.927583+00:00"
+    },
+    {
+      "ip": "65.8.20.28",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 2,
+      "hostnames": [
+        "ae.iads.unity3d.com"
+      ],
+      "first_seen": "2026-10-04T10:50:02.883742+00:00"
+    },
+    {
+      "ip": "52.85.132.91",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 1,
+      "hostnames": [
+        "i-adq.mediation.unity3d.com"
+      ],
+      "first_seen": "2026-10-04T10:50:04.637029+00:00"
+    },
+    {
+      "ip": "192.178.164.94",
+      "port": 443,
+      "protocol": "UDP",
+      "count": 15,
+      "hostnames": [
+        "fonts.gstatic.com"
+      ],
+      "first_seen": "2026-10-04T10:50:04.837597+00:00"
+    },
+    {
+      "ip": "172.217.75.155",
+      "port": 443,
+      "protocol": "UDP",
+      "count": 96,
+      "hostnames": [
+        "pagead2.googlesyndication.com"
+      ],
+      "first_seen": "2026-10-04T10:50:04.869361+00:00"
+    },
+    {
+      "ip": "142.251.181.132",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 1,
+      "hostnames": [
+        "tpc.googlesyndication.com"
+      ],
+      "first_seen": "2026-10-04T10:50:04.876931+00:00"
+    },
+    {
+      "ip": "192.178.231.94",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 1,
+      "hostnames": [
+        "www.gstatic.com"
+      ],
+      "first_seen": "2026-10-04T10:50:04.883220+00:00"
+    },
+    {
+      "ip": "172.217.75.155",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 2,
+      "hostnames": [
+        "pagead2.googlesyndication.com"
+      ],
+      "first_seen": "2026-10-04T10:50:04.895925+00:00"
+    },
+    {
+      "ip": "192.178.164.132",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 3,
+      "hostnames": [
+        "lh3.googleusercontent.com"
+      ],
+      "first_seen": "2026-10-04T10:50:05.186883+00:00"
+    },
+    {
+      "ip": "34.236.214.182",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 1,
+      "hostnames": [
+        "logs.ads.vungle.com"
+      ],
+      "first_seen": "2026-10-04T10:50:05.226501+00:00"
+    },
+    {
+      "ip": "192.178.231.155",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 1,
+      "hostnames": [
+        "pagead2.googleadservices.com"
+      ],
+      "first_seen": "2026-10-04T10:50:10.319160+00:00"
+    },
+    {
+      "ip": "142.251.121.120",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 4,
+      "hostnames": [
+        "csi.gstatic.com"
+      ],
+      "first_seen": "2026-10-04T10:50:10.339863+00:00"
+    },
+    {
+      "ip": "192.178.164.91",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 1,
+      "hostnames": [
+        "manifest.googlevideo.com"
+      ],
+      "first_seen": "2026-10-04T10:50:10.479947+00:00"
+    },
+    {
+      "ip": "142.251.121.120",
+      "port": 443,
+      "protocol": "UDP",
+      "count": 140,
+      "hostnames": [
+        "csi.gstatic.com"
+      ],
+      "first_seen": "2026-10-04T10:50:13.252670+00:00"
+    },
+    {
+      "ip": "74.125.166.1",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 1,
+      "hostnames": [
+        "rr1---sn-2o2imf-5j.googlevideo.com"
+      ],
+      "first_seen": "2026-10-04T10:50:14.014862+00:00"
+    },
+    {
+      "ip": "173.194.132.212",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 1,
+      "hostnames": [
+        "rr4---sn-aj2im9-5q.googlevideo.com"
+      ],
+      "first_seen": "2026-10-04T10:50:14.034061+00:00"
+    },
+    {
+      "ip": "1.1.1.1",
+      "port": 443,
+      "protocol": "TCP",
+      "count": 4,
+      "hostnames": [],
+      "first_seen": "2026-10-04T10:49:54.511503+00:00"
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+services:
+
+  frps:
+    image: ghcr.io/fatedier/frps:v0.71.0
+    restart: unless-stopped
+
+    environment:
+      FRP_TOKEN: ${FRP_TOKEN}
+
+    command:
+      - -c
+      - /etc/frp/frps.toml
+
+    volumes:
+      - ./frps.toml:/etc/frp/frps.toml:ro
+
+    ports:
+      - "7000:7000"
+
+    expose:
+      - "18080"
+
+    networks:
+      - phoneproxy
+
+  relay:
+    build:
+      context: ./relay
+
+    restart: unless-stopped
+
+    environment:
+      RELAY_KEY: ${RELAY_KEY}
+      PHONE_PROXY: http://${PHONE_PROXY_USER}:${PHONE_PROXY_PASS}@frps:18080
+
+    expose:
+      - "8000"
+
+    depends_on:
+      - frps
+
+    networks:
+      - phoneproxy
+
+networks:
+  phoneproxy:

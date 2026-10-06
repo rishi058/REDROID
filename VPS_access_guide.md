@@ -37,7 +37,7 @@ ssh -i "C:/Users/Rishi/.ssh/ssh-key-2026-07-06(pvt).key" `
 ## Accessing GUI of redroid 
 scrcpy -s 127.0.0.1:5555 --max-size=720 --max-fps=24 --video-bit-rate=2M --video-codec=h264 --no-audio
 
-## Connecting PORT to use "adb connect 127.0.0.1:5559"
+## SSH Tunneling b/w Oracle and Local Machine port 
 
 ssh -i "C:/Users/Rishi/.ssh/ssh-key-2026-07-06(pvt).key" `
   -o ExitOnForwardFailure=yes `
@@ -45,6 +45,9 @@ ssh -i "C:/Users/Rishi/.ssh/ssh-key-2026-07-06(pvt).key" `
   -N `
   -L 127.0.0.1:5559:127.0.0.1:5559 `
   ubuntu@141.148.151.172
+
+## Then, from another terminal use:
+adb connect 127.0.0.1:5559
 
 ## Accessing GUI of redroid 
 scrcpy -s 127.0.0.1:5559 --max-size=720 --max-fps=24 --video-bit-rate=2M --video-codec=h264 --no-audio
