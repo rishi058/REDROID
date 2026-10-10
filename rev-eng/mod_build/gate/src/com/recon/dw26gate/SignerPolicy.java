@@ -10,8 +10,34 @@ import java.util.Set;
 /** Pure request-proof policy and canonicalization shared by the bridge and host tests. */
 final class SignerPolicy {
     static final String KEY_ALIAS = "com.diskwalaapp.attest.ec.v1";
+    // One daemon serves many device identities: every enrolled DiskWala attestation
+    // key is an AndroidKeyStore alias under the app uid with this prefix. Requests
+    // select one by kid; the default alias above is used when no kid is supplied.
+    static final String ALIAS_PREFIX = "com.diskwalaapp.attest.ec";
     static final int MAX_BODY_BYTES = 16 * 1024;
     static final int MAX_FRAME_BYTES = 24 * 1024;
+    static final int MAX_CHALLENGE_BYTES = 4 * 1024;
+    // A kid is the urlsafe-b64(no pad) SHA-256 of the SPKI = 43 chars.
+    static final int KID_LEN = 43;
+
+    static boolean selectableAlias(String alias) {
+        return alias != null && alias.startsWith(ALIAS_PREFIX);
+    }
+
+    static boolean validKid(String kid) {
+        if (kid == null || kid.length() != KID_LEN) return false;
+        for (int i = 0; i < kid.length(); i++) {
+            char c = kid.charAt(i);
+            boolean ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                || (c >= '0' && c <= '9') || c == '-' || c == '_';
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    static boolean validChallenge(byte[] challenge) {
+        return challenge != null && challenge.length > 0 && challenge.length <= MAX_CHALLENGE_BYTES;
+    }
     private static final Set<String> PATHS = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(
         "/api/v2/android/np_lelo",
         "/api/v2/android/pp_lelo",

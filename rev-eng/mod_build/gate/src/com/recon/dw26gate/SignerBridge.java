@@ -67,8 +67,30 @@ final class SignerBridge implements Closeable {
             JSONObject status = new JSONObject();
             status.put("ok", true);
             status.put("alias_present", signer.aliasPresent());
+            status.put("aliases", signer.aliases());
             status.put("port", PORT);
             write(socket.getOutputStream(), status);
+            return;
+        }
+        if ("refresh_assertion".equals(op)) {
+            byte[] challenge;
+            try {
+                challenge = request.getString("challenge").getBytes(StandardCharsets.UTF_8);
+            } catch (Exception invalid) {
+                write(socket.getOutputStream(), failure("challenge_invalid"));
+                return;
+            }
+            if (!SignerPolicy.validChallenge(challenge)) {
+                write(socket.getOutputStream(), failure("challenge_invalid"));
+                return;
+            }
+            try {
+                JSONObject assertion = signer.refreshAssertion(challenge, optKid(request));
+                assertion.put("ok", true);
+                write(socket.getOutputStream(), assertion);
+            } catch (Exception signError) {
+                write(socket.getOutputStream(), failure(reason(signError)));
+            }
             return;
         }
         if (!"sign".equals(op)) {
@@ -91,9 +113,28 @@ final class SignerBridge implements Closeable {
             write(socket.getOutputStream(), failure("body_too_large"));
             return;
         }
-        JSONObject proof = signer.sign(path, body);
-        proof.put("ok", true);
-        write(socket.getOutputStream(), proof);
+        try {
+            JSONObject proof = signer.sign(path, body, optKid(request));
+            proof.put("ok", true);
+            write(socket.getOutputStream(), proof);
+        } catch (Exception signError) {
+            write(socket.getOutputStream(), failure(reason(signError)));
+        }
+    }
+
+    /** Optional kid selector; null/empty means the default alias. */
+    private static String optKid(JSONObject request) {
+        String kid = request.optString("kid", "");
+        return kid.isEmpty() ? null : kid;
+    }
+
+    /** A short, non-leaking error code for a failed signing operation. */
+    private static String reason(Exception error) {
+        String message = error.getMessage();
+        if (message != null && message.length() <= 40 && message.matches("[a-z0-9_]+")) {
+            return message;
+        }
+        return "signer_error";
     }
 
     private static byte[] readFrame(InputStream input) throws Exception {
